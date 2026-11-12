@@ -1,0 +1,393 @@
+"""Discover UPnP devices and advertise an incoming transfer destination over SSDP."""
+
+import asyncio
+import errno
+import logging
+import socket
+import time
+from collections.abc import Callable
+from ipaddress import IPv4Address
+from urllib.parse import urlsplit
+
+import ifaddr
+from pydantic import BaseModel, ConfigDict
+
+
+_LOGGER = logging.getLogger(__name__)
+
+SSDP_ADDRESS = '239.255.255.250'
+SSDP_PORT = 1900
+MEDIA_SERVER_DEVICE_TYPE = 'urn:schemas-upnp-org:device:MediaServer:1'
+
+
+def _ipv4_interfaces() -> list[str]:
+    """
+    Enumerate local addresses for multicast discovery and advertisements.
+
+    Returns:
+        list[str]: Non-loopback IPv4 addresses on configured adapters
+    """
+
+    return sorted(
+        {
+            address.ip
+            for adapter in ifaddr.get_adapters()
+            for address in adapter.ips
+            if isinstance(address.ip, str)
+            and IPv4Address(address.ip).is_loopback is False
+            and IPv4Address(address.ip).is_unspecified is False
+        }
+    )
+
+
+class SSDPResponse(BaseModel):
+    """Description location and identifiers for a device responding to M-SEARCH."""
+
+    model_config = ConfigDict(frozen=True)
+
+    location: str
+    usn: str
+    search_target: str
+    server: str | None
+    sender_address: str
+    headers: dict[str, str]
+
+
+def parse_ssdp_message(data: bytes) -> tuple[str, dict[str, str]]:
+    """
+    Split an SSDP message into its start line and headers with uppercase names.
+
+    Args:
+        data (bytes): Received UDP datagram
+
+    Returns:
+        tuple[str, dict[str, str]]: Start line and headers
+    """
+
+    lines = data.decode('iso-8859-1').split('\r\n')
+    headers: dict[str, str] = {}
+    for line in lines[1:]:
+        name, separator, value = line.partition(':')
+        if separator == '':
+            continue
+        headers[name.strip().upper()] = value.strip()
+    return lines[0], headers
+
+
+class _SearchProtocol(asyncio.DatagramProtocol):
+    def __init__(self, on_response: Callable[[SSDPResponse], None]) -> None:
+        self._on_response = on_response
+
+    def datagram_received(self, data: bytes, addr: tuple[str | int, ...]) -> None:
+        start_line, headers = parse_ssdp_message(data)
+        # M-SEARCH responses start with `HTTP/1.1 200 OK` and carry the device description URL in LOCATION
+        if start_line.startswith('HTTP/1.1 200') is False or 'LOCATION' not in headers:
+            return
+        self._on_response(
+            SSDPResponse(
+                location=headers['LOCATION'],
+                usn=headers.get('USN', ''),
+                search_target=headers.get('ST', ''),
+                server=headers.get('SERVER'),
+                sender_address=str(addr[0]),
+                headers=headers,
+            )
+        )
+
+
+async def search(
+    search_target: str = MEDIA_SERVER_DEVICE_TYPE,
+    *,
+    timeout: float = 3.0,
+    interface: str | None = None,
+    port: int = 0,
+) -> list[SSDPResponse]:
+    """
+    Send M-SEARCH and return responding devices, deduplicated by description URL.
+
+    Args:
+        search_target (str): Device or service type (defaults to DLNA media servers)
+        timeout (float): Seconds to wait for responses
+        interface (str | None): Local IPv4 address for M-SEARCH (None searches every IPv4 network)
+        port (int): UDP response port (0 lets the OS choose; specify a port allowed by the firewall if needed)
+
+    Returns:
+        list[SSDPResponse]: Responding devices
+    """
+
+    responses: dict[str, SSDPResponse] = {}
+
+    def on_response(response: SSDPResponse) -> None:
+        responses.setdefault(response.location, response)
+
+    # Responses arrive by unicast at the port that sent M-SEARCH
+    ## Connection tracking cannot associate them with the multicast request, so restrictive firewalls drop them
+    interfaces = _ipv4_interfaces() if interface in (None, '0.0.0.0') else [interface]
+    transports: list[asyncio.DatagramTransport] = []
+    try:
+        for address in interfaces:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            try:
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(address))
+                try:
+                    sock.bind((address, port))
+                except OSError as ex:
+                    # Preserve discovery when the requested response port is already in use
+                    if port == 0 or ex.errno != errno.EADDRINUSE:
+                        raise
+                    _LOGGER.warning(
+                        f'Discovery port {port} is in use on {address}; '
+                        'using an OS-assigned port (the firewall may drop responses).'
+                    )
+                    sock.bind((address, 0))
+                transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+                    lambda: _SearchProtocol(on_response), sock=sock
+                )
+            except BaseException:
+                sock.close()
+                raise
+            transports.append(transport)
+        # Devices respond at any time within MX seconds, so send twice with a delay to reduce missed responses
+        mx = max(1, min(5, int(timeout) - 1))
+        message = (
+            'M-SEARCH * HTTP/1.1\r\n'
+            f'HOST: {SSDP_ADDRESS}:{SSDP_PORT}\r\n'
+            'MAN: "ssdp:discover"\r\n'
+            f'MX: {mx}\r\n'
+            f'ST: {search_target}\r\n'
+            '\r\n'
+        ).encode()
+        for transport in transports:
+            transport.sendto(message, (SSDP_ADDRESS, SSDP_PORT))
+        await asyncio.sleep(min(0.5, timeout / 4))
+        for transport in transports:
+            transport.sendto(message, (SSDP_ADDRESS, SSDP_PORT))
+        await asyncio.sleep(timeout)
+    finally:
+        for transport in transports:
+            transport.close()
+    return list(responses.values())
+
+
+class _AdvertiserProtocol(asyncio.DatagramProtocol):
+    def __init__(self, advertiser: 'SSDPAdvertiser') -> None:
+        self._advertiser = advertiser
+
+    def datagram_received(self, data: bytes, addr: tuple[str | int, ...]) -> None:
+        self._advertiser.handle_search(data, (str(addr[0]), int(addr[1])))
+
+
+class SSDPAdvertiser:
+    """
+    Advertise an incoming transfer destination and respond to M-SEARCH on the home network.
+    Optionally restrict discovery responses to allowed transfer sources.
+    """
+
+    def __init__(
+        self,
+        *,
+        interface: str,
+        location: str,
+        udn: str,
+        targets: tuple[str, ...],
+        allowed_senders: frozenset[str] | None,
+        server: str,
+        interval: float = 30.0,
+        max_age: int = 120,
+    ) -> None:
+        """
+        Configure the advertisement.
+
+        Args:
+            interface (str): Local IPv4 address (0.0.0.0 advertises on every configured IPv4 network)
+            location (str): Device description URL
+            udn (str): Device UDN (`uuid:...`)
+            targets (tuple[str, ...]): Device and service types to advertise
+            allowed_senders (frozenset[str] | None): Permitted discovery senders (None accepts any sender)
+            server (str): SERVER header value
+            interval (float): Advertisement interval in seconds
+            max_age (int): Advertisement lifetime in seconds
+        """
+
+        self.interface = interface
+        self.location = location
+        self.udn = udn
+        self.targets = ('upnp:rootdevice', udn, *targets)
+        self.allowed_senders = allowed_senders
+        self.server = server
+        self.interval = interval
+        self.max_age = max_age
+        self._transport: asyncio.DatagramTransport | None = None
+        self._announcers: list[tuple[str, asyncio.DatagramTransport]] = []
+        self._task: asyncio.Task[None] | None = None
+
+    async def start(self) -> None:
+        """Open a discovery socket and start periodic advertisements."""
+
+        interfaces = [self.interface]
+        if self.interface == '0.0.0.0':
+            # Enumerate addresses on each NIC; hostname resolution does not enumerate all connected networks
+            interfaces = _ipv4_interfaces()
+
+        # One receive socket joins every selected network; unicast replies follow the route to the requester
+        # M-SEARCH arrives on multicast port 1900; bind so other UPnP software can share it
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, 'SO_REUSEPORT') is True:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        sock.bind(('', SSDP_PORT))
+        for interface in interfaces:
+            try:
+                sock.setsockopt(
+                    socket.IPPROTO_IP,
+                    socket.IP_ADD_MEMBERSHIP,
+                    socket.inet_aton(SSDP_ADDRESS) + socket.inet_aton(interface),
+                )
+            except OSError as ex:
+                # Multiple addresses on one NIC share a multicast membership on Linux
+                if ex.errno != errno.EADDRINUSE:
+                    sock.close()
+                    raise
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(self.interface))
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        self._transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+            lambda: _AdvertiserProtocol(self), sock=sock
+        )
+        # Separate multicast send sockets keep the source address and advertised URL on the same NIC
+        try:
+            for interface in interfaces:
+                sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                try:
+                    sender.bind((interface, 0))
+                    sender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(interface))
+                    sender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+                    transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+                        asyncio.DatagramProtocol, sock=sender
+                    )
+                except BaseException:
+                    sender.close()
+                    raise
+                self._announcers.append((interface, transport))
+        except BaseException:
+            await self.stop()
+            raise
+        self._task = asyncio.create_task(self._advertise_periodically())
+
+    async def stop(self) -> None:
+        """Stop periodic advertisements, send ssdp:byebye, and close the socket."""
+
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+        for _, transport in self._announcers:
+            for target in self.targets:
+                message = (
+                    'NOTIFY * HTTP/1.1\r\n'
+                    f'HOST: {SSDP_ADDRESS}:{SSDP_PORT}\r\n'
+                    f'NT: {target}\r\n'
+                    'NTS: ssdp:byebye\r\n'
+                    f'USN: {self._usn(target)}\r\n'
+                    '\r\n'
+                )
+                transport.sendto(message.encode(), (SSDP_ADDRESS, SSDP_PORT))
+            transport.close()
+        self._announcers.clear()
+        if self._transport is not None:
+            self._transport.close()
+            self._transport = None
+
+    def handle_search(self, data: bytes, sender: tuple[str, int]) -> None:
+        """
+        Respond to M-SEARCH from an allowed sender.
+
+        Args:
+            data (bytes): Received UDP datagram
+            sender (tuple[str, int]): Sender address and port
+        """
+
+        start_line, headers = parse_ssdp_message(data)
+        if start_line.startswith('M-SEARCH ') is False:
+            return
+        if self.allowed_senders is not None and sender[0] not in self.allowed_senders:
+            return
+        interface = self.interface
+        if interface == '0.0.0.0':
+            # UDP connect selects a local route without sending a packet or needing an Internet connection
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
+                route.connect(sender)
+                interface = str(route.getsockname()[0])
+        requested = headers.get('ST', '')
+        for target in self.targets:
+            if requested not in ('ssdp:all', target):
+                continue
+            message = (
+                'HTTP/1.1 200 OK\r\n'
+                f'CACHE-CONTROL: max-age={self.max_age}\r\n'
+                'EXT:\r\n'
+                f'LOCATION: {self._location_for(interface)}\r\n'
+                f'SERVER: {self.server}\r\n'
+                f'ST: {target}\r\n'
+                f'USN: {self._usn(target)}\r\n'
+                '\r\n'
+            )
+            if self._transport is not None:
+                self._transport.sendto(message.encode(), sender)
+            _LOGGER.info(f'Responded to SSDP discovery: {sender[0]} ({target})')
+
+    async def _advertise_periodically(self) -> None:
+        """Send periodic ssdp:alive advertisements for all targets."""
+
+        while True:
+            started_at = time.monotonic()
+            for interface, transport in self._announcers:
+                for target in self.targets:
+                    message = (
+                        'NOTIFY * HTTP/1.1\r\n'
+                        f'HOST: {SSDP_ADDRESS}:{SSDP_PORT}\r\n'
+                        f'CACHE-CONTROL: max-age={self.max_age}\r\n'
+                        f'LOCATION: {self._location_for(interface)}\r\n'
+                        f'NT: {target}\r\n'
+                        'NTS: ssdp:alive\r\n'
+                        f'SERVER: {self.server}\r\n'
+                        f'USN: {self._usn(target)}\r\n'
+                        '\r\n'
+                    )
+                    transport.sendto(message.encode(), (SSDP_ADDRESS, SSDP_PORT))
+            await asyncio.sleep(max(0.0, self.interval - (time.monotonic() - started_at)))
+
+    def _location_for(self, interface: str) -> str:
+        """
+        Advertise the concrete address of the selected network rather than a wildcard address.
+
+        Args:
+            interface (str): Local IPv4 address reachable by the recipient
+
+        Returns:
+            str: Device description URL for this network
+        """
+
+        if self.interface != '0.0.0.0':
+            return self.location
+        location = urlsplit(self.location)
+        return location._replace(netloc=f'{interface}:{location.port}').geturl()
+
+    def _usn(self, target: str) -> str:
+        """
+        Construct the USN for an advertised target.
+
+        Args:
+            target (str): Device or service target
+
+        Returns:
+            str: UDN alone for the device or UDN and target for other advertisements
+        """
+
+        # Use the UDN alone for its own advertisement, otherwise use `UDN::target`
+        if target == self.udn:
+            return self.udn
+        return f'{self.udn}::{target}'

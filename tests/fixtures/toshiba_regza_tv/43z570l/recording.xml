@@ -1,0 +1,20 @@
+<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:arib="urn:schemas-arib-or-jp:elements-1-0/" xmlns:regza="urn:schemas-toshiba-co-jp:regzadata-1-0">
+<item id="20100200000000/2010_M000000000000000000000000000002.dtv" parentID="20100200000000" restricted="1">
+<upnp:writeStatus>NOT_WRITABLE</upnp:writeStatus>
+<dc:title>伏せた値</dc:title>
+<upnp:class>object.item.videoItem</upnp:class>
+<dc:date>伏せた値</dc:date>
+<arib:objectType>ARIB_TB</arib:objectType>
+<upnp:genre>ニュース／報道</upnp:genre>
+<upnp:channelNr>伏せた値</upnp:channelNr>
+<upnp:channelName>伏せた値</upnp:channelName>
+<arib:longDescription>伏せた値</arib:longDescription>
+<regza:playbackState>1</regza:playbackState>
+<regza:genreCode>00ff</regza:genreCode>
+<regza:reserved id="1a1">伏せた値</regza:reserved>
+<res protocolInfo="http-get:*:application/x-dtcp1;DTCP1HOST=192.0.2.1;DTCP1PORT=30000;CONTENTFORMAT=&quot;video/vnd.dlna.mpeg-tts&quot;:DLNA.ORG_PN=DTCP_MPEG_TS_JP_T;DLNA.ORG_OP=10;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01110000000000000000000000000000;ARIB.OR.JP_PN=MPEG_TTS_CP" duration="0:17:03.000" bitrate="1524736" regza:framerate="60i">http://192.0.2.1:10480/2010_M000000000000000000000000000002.dtv</res>
+<res protocolInfo="http-get:*:application/x-dtcp1;DTCP1HOST=192.0.2.1;DTCP1PORT=30000;CONTENTFORMAT=&quot;video/vnd.dlna.mpeg-tts&quot;:DLNA.ORG_OP=10;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01110000000000000000000000000000;ARIB.OR.JP_PN=MPEG_TTS_CP" duration="0:17:03.000" bitrate="1524736" regza:framerate="60i">http://192.0.2.1:10480/2010_M000000000000000000000000000002.dtv</res>
+<regza:network_id>7fe6</regza:network_id>
+<regza:service_id>430</regza:service_id>
+</item>
+</DIDL-Lite>

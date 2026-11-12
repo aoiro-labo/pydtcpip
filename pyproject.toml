@@ -1,0 +1,122 @@
+[project]
+name = "pydtcpip"
+version = "0.0.1"
+description = "Unofficial Python implementation of DTCP-IP with DLNA/UPnP support, an async API, and a CLI for streaming and transferring recordings"
+readme = "Readme.md"
+license = "MIT"
+license-files = ["License.txt"]
+requires-python = ">=3.13"
+authors = [
+    { name = "tsukumi", email = "tsukumijima@users.noreply.github.com" },
+]
+keywords = ["dlna", "dtcp-ip", "upnp", "recorder", "mpeg-ts"]
+classifiers = [
+    "Operating System :: POSIX",
+    "Operating System :: Unix",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Framework :: AsyncIO",
+    "Topic :: Multimedia :: Video",
+    "Intended Audience :: Developers",
+]
+dependencies = [
+    "aiohttp>=3.14.5",
+    "cryptography>=50.0.2",
+    # DTCP uses a curve not named by OpenSSL, so use ecdsa for arbitrary curve support
+    "ecdsa>=0.19.2,<1.0.0",
+    "ifaddr>=0.2.0",
+    "pydantic>=2.14.3",
+    "pydantic-settings>=2.16.2",
+    "rich>=15.0.0",
+    "typer>=0.29.1",
+]
+
+[dependency-groups]
+dev = [
+    "anyio>=4.16.0",
+    "pyright>=1.1.414",
+    "pytest>=9.2.0",
+    "ruff>=0.17.4,<1.0.0",
+    "taskipy>=1.14.1",
+]
+
+[project.scripts]
+pydtcpip = "pydtcpip.__main__:app"
+
+[tool.taskipy.tasks]
+lint = "ruff check --fix . ; pyright"
+format = "ruff format ."
+typecheck = "pyright"
+test = "pytest"
+
+[build-system]
+requires = ["uv_build>=0.12.19,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.uv.build-backend]
+# The package is at the repository root
+module-root = ""
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+# Limit lines to 120 characters
+line-length = 120
+# Use four spaces for indentation
+indent-width = 4
+# Target Python 3.13
+target-version = "py313"
+
+[tool.ruff.lint]
+# Enable flake8, pycodestyle, pyupgrade, isort, and Ruff rules
+select = ["F", "E", "W", "UP", "I", "RUF"]
+ignore = [
+    "E501",    # Allow lines longer than the limit
+    "RUF001",  # Allow ambiguous Unicode characters in strings
+    "RUF002",  # Allow ambiguous Unicode characters in docstrings
+    "RUF003",  # Allow ambiguous Unicode characters in comments
+]
+
+[tool.ruff.lint.isort]
+# Leave two blank lines after the import block
+lines-after-imports = 2
+
+[tool.ruff.format]
+# Use single quotes
+quote-style = "single"
+# Use spaces for indentation
+indent-style = "space"
+
+[tool.pyright]
+# Target Python version
+pythonVersion = "3.13"
+# Use the project virtual environment
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "strict"
+pythonPlatform = "All"
+# Paths to check
+include = [
+    "pydtcpip/",
+    "tests/",
+]
+# Paths to exclude
+exclude = [
+    "**/__pycache__",
+    "**/.venv",
+]
+# Suppress selected Pyright/Pylance type errors
+## ecdsa has no type annotations, so do not report unknown types derived from its return values
+reportMissingTypeStubs = "none"
+reportUnknownArgumentType = "none"
+reportUnknownMemberType = "none"
+reportUnknownVariableType = "none"
