@@ -242,6 +242,24 @@ def test_short_unknown_integers_survive_without_retaining_sensitive_fields(kind:
     assert '<!-- 123 -->' not in redacted
 
 
+@pytest.mark.parametrize('name', ['credential', 'credentials'])
+def test_short_credentials_are_redacted_in_text_attributes_and_ancestors(name: str) -> None:
+    """Exclude explicitly named credentials from the diagnostic integer exception."""
+
+    xml = (
+        f'<root><{name}>123</{name}><vendor {name}="123"/>'
+        f'<{name}><value>123</value><part value="123"/></{name}>'
+        '<counter>123</counter></root>'
+    )
+    root = ET.fromstring(Redactor().redact_xml(xml, 'didl'))
+    text, attribute, ancestor, counter = root
+    assert text.text == 'redacted'
+    assert attribute.get(name) == 'redacted'
+    assert ancestor[0].text == 'redacted'
+    assert ancestor[1].get('value') == 'redacted'
+    assert counter.text == '123'
+
+
 def test_fixtures_contain_no_private_network_addresses_or_identifiers() -> None:
     # Detect local network addresses or device UUIDs left in contributed fixtures
     private_address = re.compile(r'(?<![\d.])(?:10\.\d+|172\.(?:1[6-9]|2\d|3[01])|192\.168)\.\d+\.\d+')
