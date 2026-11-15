@@ -140,6 +140,16 @@ def test_recording_identifiers_and_url_references_share_replacements() -> None:
     assert again.get('id') == item.get('id')
 
 
+def test_resource_query_names_mask_embedded_identifiers() -> None:
+    """Keep query names useful while applying the existing address mask to embedded addresses."""
+
+    xml = '<res>http://198.51.100.20/media?client_198.51.100.20=9&amp;quality=1</res>'
+    root = ET.fromstring(Redactor().redact_xml(xml, 'didl'))
+    url = urlsplit(root.text or '')
+    assert '198.51.100.20' not in (root.text or '')
+    assert set(parse_qs(url.query)) == {f'client_{url.hostname}', 'quality'}
+
+
 def test_headers_keep_only_known_values() -> None:
     # Redact filenames and retrieval dates while retaining headers describing the stream format
     redacted = dict(

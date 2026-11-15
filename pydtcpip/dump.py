@@ -349,7 +349,10 @@ class Redactor:
         parts = urlsplit(stripped)
         segments = [self._mask_object_id(unquote(segment)) if segment else '' for segment in parts.path.split('/')]
         query = urlencode(
-            [(name, self._mask_object_id(value)) for name, value in parse_qsl(parts.query, keep_blank_values=True)]
+            [
+                (self._mask_identifiers(name), self._mask_object_id(value))
+                for name, value in parse_qsl(parts.query, keep_blank_values=True)
+            ]
         )
         # User information and fragments are not required to inspect a resource's format
         authority = self._mask_identifiers(parts.netloc.rsplit('@', 1)[-1])
