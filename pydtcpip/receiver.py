@@ -177,25 +177,30 @@ class DubbingReceiver:
 
         self._http_session = aiohttp.ClientSession()
         self._runner = web.AppRunner(application, access_log=_LOGGER)
-        await self._runner.setup()
-        site = web.TCPSite(self._runner, self.interface, self.port)
-        await site.start()
+        try:
+            await self._runner.setup()
+            site = web.TCPSite(self._runner, self.interface, self.port)
+            await site.start()
 
-        # Advertise the OS-assigned port when the requested listening port was 0
-        if self.port == 0:
-            server = site._server  # pyright: ignore[reportPrivateUsage]
-            if isinstance(server, asyncio.Server) and len(server.sockets) > 0:
-                self.port = int(server.sockets[0].getsockname()[1])
+            # Advertise the OS-assigned port when the requested listening port was 0
+            if self.port == 0:
+                server = site._server  # pyright: ignore[reportPrivateUsage]
+                if isinstance(server, asyncio.Server) and len(server.sockets) > 0:
+                    self.port = int(server.sockets[0].getsockname()[1])
 
-        self._advertiser = SSDPAdvertiser(
-            interface=self.interface,
-            location=f'{self.base_url}/description.xml',
-            udn=self.udn,
-            targets=(MEDIA_SERVER_DEVICE_TYPE, _CONTENT_DIRECTORY, _CONNECTION_MANAGER),
-            allowed_senders=self.allowed_sources,
-            server='Python UPnP/1.0 pydtcpip/1.0',
-        )
-        await self._advertiser.start()
+            self._advertiser = SSDPAdvertiser(
+                interface=self.interface,
+                location=f'{self.base_url}/description.xml',
+                udn=self.udn,
+                targets=(MEDIA_SERVER_DEVICE_TYPE, _CONTENT_DIRECTORY, _CONNECTION_MANAGER),
+                allowed_senders=self.allowed_sources,
+                server='Python UPnP/1.0 pydtcpip/1.0',
+            )
+            await self._advertiser.start()
+        except BaseException:
+            # Startup may fail after HTTP begins listening; release every acquired resource before retrying
+            await self.stop()
+            raise
         _LOGGER.info(
             f'Listening for incoming transfers: {self.name} ({self.base_url}), '
             f'sources: {", ".join(sorted(self.allowed_sources)) if self.allowed_sources is not None else "any"}'

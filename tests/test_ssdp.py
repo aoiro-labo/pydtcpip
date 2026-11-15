@@ -5,11 +5,14 @@ import errno
 import socket
 import sys
 
+import aiohttp
 import pytest
 from aiohttp import web
 
 from pydtcpip.dlna import ssdp
 from pydtcpip.dlna.client import DLNAClient
+from pydtcpip.receiver import DubbingReceiver
+from tests.fakes import FakeDevice, MemorySink
 
 
 @pytest.mark.anyio
@@ -173,6 +176,33 @@ async def test_advertiser_reports_unavailable_interfaces(monkeypatch: pytest.Mon
             probe.bind(('', port))
     finally:
         await advertiser.stop()
+
+
+@pytest.mark.anyio
+async def test_receiver_releases_http_after_advertisement_failure(
+    monkeypatch: pytest.MonkeyPatch, sink_device: FakeDevice
+) -> None:
+    """Release the HTTP port after discovery startup fails, then retry on the same receiver."""
+
+    monkeypatch.setattr(ssdp, '_ipv4_interfaces', lambda: list[str]())
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as port_socket:
+        port_socket.bind(('127.0.0.1', 0))
+        monkeypatch.setattr(ssdp, 'SSDP_PORT', port_socket.getsockname()[1])
+    receiver = DubbingReceiver(sink_device.credentials(), lambda recording: MemorySink(), port=0)
+    try:
+        with pytest.raises(OSError, match='No IPv4 interface'):
+            await receiver.start()
+        # The real HTTP listener opened before SSDP failed must no longer accept connections
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            assert probe.connect_ex(('127.0.0.1', receiver.port)) != 0
+        monkeypatch.setattr(ssdp, '_ipv4_interfaces', lambda: ['127.0.0.1'])
+        await receiver.start()
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f'http://127.0.0.1:{receiver.port}/description.xml') as response:
+                assert response.status == 200
+                assert 'pydtcpip' in await response.text()
+    finally:
+        await receiver.stop()
 
 
 @pytest.mark.anyio
