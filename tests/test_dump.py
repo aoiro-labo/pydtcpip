@@ -2,6 +2,8 @@
 
 import re
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+from xml.etree import ElementTree as ET
 
 from pydtcpip.dump import Redactor
 
@@ -106,6 +108,34 @@ def test_item_fragment_without_root_is_redacted() -> None:
     redacted = Redactor().redact_xml(fragment, 'didl')
     assert '秘密の番組' not in redacted
     assert '2020-12-31T23:59:59' not in redacted
+
+
+def test_recording_identifiers_and_url_references_share_replacements() -> None:
+    """Replace numeric recording IDs in metadata and resource URLs consistently across files."""
+
+    redactor = Redactor()
+    xml = """<DIDL-Lite><container id="12345" parentID="0"/>
+    <item id="1234567890123456789" parentID="12345" refID="1234567890123456789">
+    <res size="1234567890123456789" protocolInfo="http-get:*:video/mp4:DLNA.ORG_FLAGS=01110000000000000000000000000000"
+    importUri="http://192.0.2.10/import?id=1234567890123456789">http://192.0.2.10/media/1234567890123456789?id=1234567890123456789&amp;token=private-token</res>
+    </item></DIDL-Lite>"""
+    root = ET.fromstring(redactor.redact_xml(xml, 'didl'))
+    folder, item = root
+    resource = item[0]
+    assert folder.get('id') != '12345'
+    assert folder.get('parentID') == '0'
+    assert item.get('parentID') == folder.get('id')
+    assert item.get('id') != '1234567890123456789'
+    assert item.get('refID') == item.get('id')
+    url = urlsplit(resource.text or '')
+    assert url.path.split('/')[-1] == item.get('id')
+    assert parse_qs(url.query)['id'] == [item.get('id')]
+    assert 'private-token' not in url.query
+    assert parse_qs(urlsplit(resource.attrib['importUri']).query)['id'] == [item.get('id')]
+    assert resource.get('size') == '1234567890123456789'
+    assert 'DLNA.ORG_FLAGS=01110000000000000000000000000000' in resource.attrib['protocolInfo']
+    again = ET.fromstring(redactor.redact_xml('<item id="1234567890123456789"/>', 'didl'))
+    assert again.get('id') == item.get('id')
 
 
 def test_headers_keep_only_known_values() -> None:

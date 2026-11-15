@@ -3,9 +3,10 @@
 import ipaddress
 import re
 from collections.abc import Callable
+from html import escape, unescape
 from pathlib import Path
 from typing import Literal
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 from pydantic import BaseModel, ConfigDict
@@ -232,7 +233,12 @@ class Redactor:
             if token.strip() == '':
                 output.append(token)
             elif current in kept_texts or is_capability is True:
-                output.append(self._mask_url(token) if current == 'res' else self._mask_identifiers(token))
+                if current == 'res':
+                    value = token[9:-3] if is_cdata is True else unescape(token)
+                    masked = self._mask_url(value)
+                    output.append(f'<![CDATA[{masked}]]>' if is_cdata is True else escape(masked, quote=False))
+                else:
+                    output.append(self._mask_identifiers(token))
             else:
                 leading = token[: len(token) - len(token.lstrip())]
                 trailing = token[len(token.rstrip()) :]
@@ -280,15 +286,17 @@ class Redactor:
 
         if local_name not in kept_attributes:
             value = _REDACTED_TEXT
+        elif local_name in ('id', 'parentID', 'refID'):
+            value = self._mask_object_id(unescape(attribute.group('value')))
         elif local_name == 'importUri':
-            value = self._mask_url(attribute.group('value'))
+            value = escape(self._mask_url(unescape(attribute.group('value'))), quote=True)
         else:
             value = self._mask_identifiers(attribute.group('value'))
         return f'{name}{attribute.group("equals")}{attribute.group("quote")}{value}{attribute.group("quote")}'
 
     def _mask_url(self, text: str) -> str:
         """
-        Replace URL addresses and identifiers, and redact non-ASCII path segments that may contain titles.
+        Replace resource URL path segments and query values using the same aliases as object IDs.
 
         Args:
             text (str): Text containing a resource URL
@@ -299,14 +307,29 @@ class Redactor:
 
         stripped = text.strip()
         parts = urlsplit(stripped)
-        if parts.scheme == '' or parts.netloc == '':
-            return self._mask_identifiers(text)
-        segments: list[str] = []
-        for segment in parts.path.split('/'):
-            is_non_ascii = segment.isascii() is False or unquote(segment).isascii() is False
-            segments.append(_REDACTED_TEXT if is_non_ascii is True else segment)
-        masked = urlunsplit((parts.scheme, parts.netloc, '/'.join(segments), parts.query, parts.fragment))
-        return text.replace(stripped, self._mask_identifiers(masked))
+        segments = [self._mask_object_id(unquote(segment)) if segment else '' for segment in parts.path.split('/')]
+        query = urlencode(
+            [(name, self._mask_object_id(value)) for name, value in parse_qsl(parts.query, keep_blank_values=True)]
+        )
+        # User information and fragments are not required to inspect a resource's format
+        authority = self._mask_identifiers(parts.netloc.rsplit('@', 1)[-1])
+        masked = urlunsplit((parts.scheme, authority, '/'.join(segments), query, ''))
+        return text.replace(stripped, masked)
+
+    def _mask_object_id(self, value: str) -> str:
+        """
+        Replace an opaque identifier while retaining the standard root and no-parent values.
+
+        Args:
+            value (str): Decoded object ID, URL path segment, or query value
+
+        Returns:
+            str: Consistent synthetic identifier
+        """
+
+        if value in ('0', '-1'):
+            return value
+        return self._replace('object', value, lambda n: f'object-{n}')
 
     def _mask_identifiers(self, text: str) -> str:
         """
@@ -360,7 +383,7 @@ class Redactor:
         """
 
         # Reuse replacements for identical values and number each category separately
-        key = f'{category}:{original.lower()}'
+        key = f'{category}:{original if category == "object" else original.lower()}'
         if key not in self._replacements:
             self._counts[category] = self._counts.get(category, 0) + 1
             self._replacements[key] = make(self._counts[category])
