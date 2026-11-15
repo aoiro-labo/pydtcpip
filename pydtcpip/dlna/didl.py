@@ -79,9 +79,14 @@ def parse_didl(raw_xml: str, profile: Profile) -> list[Container | Recording]:
                     title=element.findtext(f'{{{DC_NAMESPACE}}}title') or '',
                     upnp_class=element.findtext(f'{{{UPNP_NAMESPACE}}}class') or '',
                     description=element.findtext(f'{{{DC_NAMESPACE}}}description'),
-                    # The detailed description may use either the UPnP or ARIB namespace
-                    long_description=element.findtext(f'{{{UPNP_NAMESPACE}}}longDescription')
-                    or element.findtext(f'{{{ARIB_NAMESPACE}}}longDescription'),
+                    # Recorders may split details across multiple UPnP or ARIB elements
+                    long_description='\n'.join(
+                        child.text
+                        for child in element
+                        if child.tag in (f'{{{UPNP_NAMESPACE}}}longDescription', f'{{{ARIB_NAMESPACE}}}longDescription')
+                        and child.text
+                    )
+                    or None,
                     channel_name=element.findtext(f'{{{UPNP_NAMESPACE}}}channelName'),
                     genres=tuple(genre.text or '' for genre in element.iterfind(f'{{{UPNP_NAMESPACE}}}genre')),
                     date=element.findtext(f'{{{DC_NAMESPACE}}}date'),

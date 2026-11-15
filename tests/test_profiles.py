@@ -204,6 +204,28 @@ def test_nasne_reports_client_registration_refusal() -> None:
     assert NASNE.resolve_http_status()(404, 'http://192.0.2.1/2') is None
 
 
+def test_recording_keeps_all_long_descriptions_in_document_order() -> None:
+    """Keep repeated ARIB and UPnP descriptions, including normalized broadcast marks."""
+
+    objects = parse_didl(
+        '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
+        'xmlns:arib="urn:schemas-arib-or-jp:elements-1-0/" '
+        'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
+        '<item id="recording" parentID="0">'
+        '<arib:longDescription>Summary\ue0fe</arib:longDescription>'
+        '<upnp:longDescription>Cast</upnp:longDescription>'
+        '<arib:longDescription />'
+        '<arib:longDescription>More details</arib:longDescription>'
+        '</item><item id="no-description" parentID="0" /></DIDL-Lite>',
+        GENERIC,
+    )
+    recording, undescribed = objects
+    assert isinstance(recording, Recording)
+    assert isinstance(undescribed, Recording)
+    assert recording.long_description == 'Summary🈑\nCast\nMore details'
+    assert undescribed.long_description is None
+
+
 @pytest.mark.parametrize(
     ('count', 'expected_status', 'expected_value'),
     [
