@@ -36,8 +36,32 @@ def _ipv4_interfaces() -> list[str]:
             if isinstance(address.ip, str)
             and IPv4Address(address.ip).is_loopback is False
             and IPv4Address(address.ip).is_unspecified is False
+            and IPv4Address(address.ip).is_link_local is False
         }
     )
+
+
+def _multicast_socket(address: str) -> socket.socket | None:
+    """
+    Create a UDP socket that sends multicast traffic through one local address.
+
+    Args:
+        address (str): Local IPv4 address of the interface to use
+
+    Returns:
+        socket.socket | None: Configured socket, or None when the interface cannot carry multicast
+    """
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    try:
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        # Some virtual adapters and automatic private addresses reject the multicast interface option
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(address))
+    except OSError as ex:
+        sock.close()
+        _LOGGER.warning(f'Skipping the network interface {address} because it cannot carry multicast ({ex}).')
+        return None
+    return sock
 
 
 class SSDPResponse(BaseModel):
@@ -126,10 +150,10 @@ async def search(
     transports: list[asyncio.DatagramTransport] = []
     try:
         for address in interfaces:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            sock = _multicast_socket(address)
+            if sock is None:
+                continue
             try:
-                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-                sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(address))
                 try:
                     sock.bind((address, port))
                 except OSError as ex:
@@ -249,19 +273,23 @@ class SSDPAdvertiser:
                 if ex.errno != errno.EADDRINUSE:
                     sock.close()
                     raise
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(self.interface))
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(self.interface))
+        except OSError as ex:
+            # An unusable interface must not prevent advertising on the remaining ones
+            _LOGGER.warning(f'Cannot select the network interface {self.interface} for multicast ({ex}).')
         self._transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
             lambda: _AdvertiserProtocol(self), sock=sock
         )
         # Separate multicast send sockets keep the source address and advertised URL on the same NIC
         try:
             for interface in interfaces:
-                sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+                sender = _multicast_socket(interface)
+                if sender is None:
+                    continue
                 try:
                     sender.bind((interface, 0))
-                    sender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(interface))
-                    sender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
                     transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
                         asyncio.DatagramProtocol, sock=sender
                     )
