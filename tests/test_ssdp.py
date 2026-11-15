@@ -108,10 +108,20 @@ async def test_search_reports_unavailable_interfaces(monkeypatch: pytest.MonkeyP
 
 @pytest.mark.anyio
 @pytest.mark.skipif(sys.platform != 'linux', reason='Exercises Linux multicast membership with loopback aliases')
-async def test_advertiser_accepts_multiple_addresses_on_one_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Start with two loopback aliases and return a reachable description URL over UDP."""
+@pytest.mark.parametrize(
+    'addresses',
+    [
+        ['127.0.0.1', '127.0.0.2'],
+        ['192.0.2.123', '127.0.0.1', '127.0.0.2'],
+        ['127.0.0.1', '127.0.0.2', '192.0.2.123'],
+    ],
+)
+async def test_advertiser_accepts_multiple_addresses_on_one_adapter(
+    monkeypatch: pytest.MonkeyPatch, addresses: list[str]
+) -> None:
+    """Advertise on loopback aliases and skip unavailable automatic candidates."""
 
-    monkeypatch.setattr(ssdp, '_ipv4_interfaces', lambda: ['127.0.0.1', '127.0.0.2'])
+    monkeypatch.setattr(ssdp, '_ipv4_interfaces', lambda: addresses)
     # Allocate a private discovery port; advertisements only leave through loopback
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as port_socket:
         port_socket.bind(('127.0.0.1', 0))
@@ -132,6 +142,35 @@ async def test_advertiser_accepts_multiple_addresses_on_one_adapter(monkeypatch:
         responses = await ssdp.search(interface='127.0.0.1', timeout=0.1)
         assert len(responses) == 1
         assert responses[0].location == 'http://127.0.0.1:57000/description.xml'
+    finally:
+        await advertiser.stop()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('interface', ['0.0.0.0', '192.0.2.123'])
+async def test_advertiser_reports_unavailable_interfaces(monkeypatch: pytest.MonkeyPatch, interface: str) -> None:
+    """Fail and release the listener if no usable advertisement interface exists."""
+
+    monkeypatch.setattr(ssdp, '_ipv4_interfaces', lambda: ['192.0.2.123'])
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as port_socket:
+        port_socket.bind(('127.0.0.1', 0))
+        port = port_socket.getsockname()[1]
+    monkeypatch.setattr(ssdp, 'SSDP_PORT', port)
+    advertiser = ssdp.SSDPAdvertiser(
+        interface=interface,
+        location='http://0.0.0.0:57000/description.xml',
+        udn='uuid:local-test',
+        targets=(ssdp.MEDIA_SERVER_DEVICE_TYPE,),
+        allowed_senders=None,
+        server='test',
+    )
+    try:
+        with pytest.raises(OSError) as error:
+            await advertiser.start()
+        assert error.value.errno == errno.EADDRNOTAVAIL
+        # A failed startup must release port 1900 so the caller can retry immediately
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.bind(('', port))
     finally:
         await advertiser.stop()
 

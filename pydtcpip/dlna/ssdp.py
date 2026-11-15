@@ -245,43 +245,59 @@ class SSDPAdvertiser:
         # One receive socket joins every selected network; unicast replies follow the route to the requester
         # M-SEARCH arrives on multicast port 1900; bind so other UPnP software can share it
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if hasattr(socket, 'SO_REUSEPORT') is True:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        sock.bind(('', SSDP_PORT))
-        for interface in interfaces:
-            try:
-                sock.setsockopt(
-                    socket.IPPROTO_IP,
-                    socket.IP_ADD_MEMBERSHIP,
-                    socket.inet_aton(SSDP_ADDRESS) + socket.inet_aton(interface),
-                )
-            except OSError as ex:
-                # Multiple addresses on one NIC share a multicast membership on Linux
-                if ex.errno != errno.EADDRINUSE:
-                    sock.close()
-                    raise
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(self.interface))
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-        self._transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
-            lambda: _AdvertiserProtocol(self), sock=sock
-        )
-        # Separate multicast send sockets keep the source address and advertised URL on the same NIC
+        unavailable_error: OSError | None = None
         try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, 'SO_REUSEPORT') is True:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            sock.bind(('', SSDP_PORT))
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(self.interface))
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+
+            # Prepare a sender before joining its network so stale adapter addresses can be skipped
+            ## Separate send sockets keep the source address and advertised URL on the same NIC
             for interface in interfaces:
                 sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
                 try:
                     sender.bind((interface, 0))
                     sender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(interface))
                     sender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+                    try:
+                        sock.setsockopt(
+                            socket.IPPROTO_IP,
+                            socket.IP_ADD_MEMBERSHIP,
+                            socket.inet_aton(SSDP_ADDRESS) + socket.inet_aton(interface),
+                        )
+                    except OSError as ex:
+                        # Multiple addresses on one NIC share a multicast membership on Linux
+                        if ex.errno != errno.EADDRINUSE:
+                            raise
                     transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
                         asyncio.DatagramProtocol, sock=sender
                     )
+                except OSError as ex:
+                    sender.close()
+                    # Keep automatic advertisements active on the remaining usable networks
+                    if self.interface == '0.0.0.0' and ex.errno == errno.EADDRNOTAVAIL:
+                        _LOGGER.warning(f'Cannot use advertisement interface {interface}: {ex}')
+                        unavailable_error = ex
+                        continue
+                    raise
                 except BaseException:
                     sender.close()
                     raise
                 self._announcers.append((interface, transport))
+
+            # Report failure instead of starting a receiver that cannot advertise on any network
+            if len(self._announcers) == 0:
+                if unavailable_error is not None:
+                    raise unavailable_error
+                raise OSError(errno.EADDRNOTAVAIL, 'No IPv4 interface is available for SSDP advertisements.')
+            self._transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+                lambda: _AdvertiserProtocol(self), sock=sock
+            )
         except BaseException:
+            sock.close()
             await self.stop()
             raise
         self._task = asyncio.create_task(self._advertise_periodically())
