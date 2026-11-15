@@ -3,6 +3,7 @@
 import asyncio
 import socket
 import sys
+from typing import cast
 
 import pytest
 from aiohttp import web
@@ -153,6 +154,51 @@ async def test_search_uses_each_address_and_deduplicates_responses(
         assert results[0].location == 'http://127.0.0.1/description.xml'
     finally:
         responder.close()
+
+
+def test_join_multicast_group_reports_an_interface_that_cannot_join(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Report an interface that cannot join the group instead of aborting the advertisement."""
+
+    class _RejectingSocket:
+        """Socket that refuses to join the multicast group."""
+
+        def setsockopt(self, level: int, optname: int, value: object) -> None:
+            raise OSError(10049, 'The requested address is not valid in its context')
+
+    # The helper is private, so reach it without importing it directly
+    join_multicast_group = getattr(ssdp, '_join_multicast_group')
+    assert join_multicast_group(cast(socket.socket, _RejectingSocket()), '192.0.2.10') is False
+
+
+@pytest.mark.anyio
+async def test_advertiser_skips_an_interface_that_cannot_join_the_multicast_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep advertising on the remaining interfaces when one cannot join the multicast group."""
+
+    monkeypatch.setattr(ssdp, '_ipv4_interfaces', lambda: ['127.0.0.1'])
+    # Allocate a private discovery port; advertisements only leave through loopback
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as port_socket:
+        port_socket.bind(('127.0.0.1', 0))
+        port = port_socket.getsockname()[1]
+    monkeypatch.setattr(ssdp, 'SSDP_PORT', port)
+
+    def reject_multicast_group(sock: socket.socket, interface: str) -> bool:
+        return False
+
+    monkeypatch.setattr(ssdp, '_join_multicast_group', reject_multicast_group)
+    advertiser = ssdp.SSDPAdvertiser(
+        interface='127.0.0.1',
+        location='http://127.0.0.1:57000/description.xml',
+        udn='uuid:local-test',
+        targets=(ssdp.MEDIA_SERVER_DEVICE_TYPE,),
+        allowed_senders=None,
+        server='test',
+    )
+    try:
+        await advertiser.start()
+    finally:
+        await advertiser.stop()
 
 
 @pytest.mark.anyio

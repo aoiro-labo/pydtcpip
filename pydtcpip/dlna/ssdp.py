@@ -64,6 +64,34 @@ def _multicast_socket(address: str) -> socket.socket | None:
     return sock
 
 
+def _join_multicast_group(sock: socket.socket, interface: str) -> bool:
+    """
+    Join the SSDP multicast group through one local address.
+
+    Args:
+        sock (socket.socket): Socket to join the group on
+        interface (str): Local IPv4 address of the interface to use
+
+    Returns:
+        bool: True when the group was joined, False when the interface cannot join it
+    """
+
+    try:
+        sock.setsockopt(
+            socket.IPPROTO_IP,
+            socket.IP_ADD_MEMBERSHIP,
+            socket.inet_aton(SSDP_ADDRESS) + socket.inet_aton(interface),
+        )
+    except OSError as ex:
+        # Multiple addresses on one NIC share a multicast membership on Linux
+        ## An interface that cannot join the group must not prevent advertising on the remaining ones
+        _LOGGER.warning(
+            f'Skipping the network interface {interface} because it cannot join the multicast group ({ex}).'
+        )
+        return False
+    return True
+
+
 class SSDPResponse(BaseModel):
     """Description location and identifiers for a device responding to M-SEARCH."""
 
@@ -262,17 +290,7 @@ class SSDPAdvertiser:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         sock.bind(('', SSDP_PORT))
         for interface in interfaces:
-            try:
-                sock.setsockopt(
-                    socket.IPPROTO_IP,
-                    socket.IP_ADD_MEMBERSHIP,
-                    socket.inet_aton(SSDP_ADDRESS) + socket.inet_aton(interface),
-                )
-            except OSError as ex:
-                # Multiple addresses on one NIC share a multicast membership on Linux
-                if ex.errno != errno.EADDRINUSE:
-                    sock.close()
-                    raise
+            _join_multicast_group(sock, interface)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
         try:
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(self.interface))
