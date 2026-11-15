@@ -310,7 +310,9 @@ class Redactor:
                 else _REDACTED_TEXT
             )
         elif local_name in ('id', 'parentID', 'refID'):
-            value = self._mask_object_id(unescape(attribute.group('value')))
+            original = unescape(attribute.group('value'))
+            # Some object IDs contain the same query key as their media resource URLs
+            value = escape(self._mask_url(original) if '?' in original else self._mask_object_id(original), quote=True)
         elif local_name == 'importUri':
             value = escape(self._mask_url(unescape(attribute.group('value'))), quote=True)
         else:

@@ -150,6 +150,31 @@ def test_resource_query_names_mask_embedded_identifiers() -> None:
     assert set(parse_qs(url.query)) == {f'client_{url.hostname}', 'quality'}
 
 
+def test_nasne_object_id_preserves_shared_resource_query_values() -> None:
+    """Keep the shared recording key when a nasne object ID itself contains a query string."""
+
+    redactor = Redactor()
+    xml = """<DIDL-Lite><item id="0/video/all/pvr?id=1234567890123456789&amp;group=1" parentID="0/video/all">
+    <res>http://198.51.100.20:6420/recorded?id=1234567890123456789&amp;quality=1</res>
+    <res><![CDATA[http://198.51.100.20:6420/recorded?id=1234567890123456789&quality=2]]></res>
+    </item></DIDL-Lite>"""
+    root = ET.fromstring(redactor.redact_xml(xml, 'didl'))
+    item = root[0]
+    object_query = parse_qs(urlsplit(item.attrib['id']).query)
+    assert 'id' in object_query
+    assert object_query['id'] != ['1234567890123456789']
+    for resource in item:
+        assert parse_qs(urlsplit(resource.text or '').query)['id'] == object_query['id']
+    assert (
+        parse_qs(urlsplit(item[0].text or '').query)['quality']
+        != parse_qs(urlsplit(item[1].text or '').query)['quality']
+    )
+    reference = ET.fromstring(
+        redactor.redact_xml('<item refID="0/video/all/pvr?id=1234567890123456789&amp;group=1"/>', 'didl')
+    )
+    assert reference.get('refID') == item.get('id')
+
+
 def test_headers_keep_only_known_values() -> None:
     # Redact filenames and retrieval dates while retaining headers describing the stream format
     redacted = dict(
