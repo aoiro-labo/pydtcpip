@@ -124,6 +124,7 @@ async def search(
     ## Connection tracking cannot associate them with the multicast request, so restrictive firewalls drop them
     interfaces = _ipv4_interfaces() if interface in (None, '0.0.0.0') else [interface]
     transports: list[asyncio.DatagramTransport] = []
+    unavailable_error: OSError | None = None
     try:
         for address in interfaces:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -144,10 +145,21 @@ async def search(
                 transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
                     lambda: _SearchProtocol(on_response), sock=sock
                 )
+            except OSError as ex:
+                sock.close()
+                # Disconnected adapters can retain addresses; search through the remaining local networks
+                if interface in (None, '0.0.0.0') and ex.errno == errno.EADDRNOTAVAIL:
+                    _LOGGER.warning(f'Cannot use discovery interface {address}: {ex}')
+                    unavailable_error = ex
+                    continue
+                raise
             except BaseException:
                 sock.close()
                 raise
             transports.append(transport)
+        # Surface the address error when automatic discovery has no usable network
+        if len(transports) == 0 and unavailable_error is not None:
+            raise unavailable_error
         # Devices respond at any time within MX seconds, so send twice with a delay to reduce missed responses
         mx = max(1, min(5, int(timeout) - 1))
         message = (

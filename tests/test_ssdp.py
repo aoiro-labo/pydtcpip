@@ -1,6 +1,7 @@
 """Exercise discovery over real local UDP sockets without contacting home devices."""
 
 import asyncio
+import errno
 import socket
 import sys
 
@@ -60,6 +61,49 @@ async def test_search_uses_each_address_and_deduplicates_responses(
         assert results[0].location == 'http://127.0.0.1/description.xml'
     finally:
         responder.close()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('interface', [None, '0.0.0.0'])
+async def test_search_skips_unavailable_addresses(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, interface: str | None
+) -> None:
+    """Discover through loopback even when an enumerated address cannot be bound."""
+
+    monkeypatch.setattr(ssdp, '_ipv4_interfaces', lambda: ['192.0.2.123', '127.0.0.1'])
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as responder:
+        responder.bind(('127.0.0.1', 0))
+        responder.setblocking(False)
+        monkeypatch.setattr(ssdp, 'SSDP_ADDRESS', '127.0.0.1')
+        monkeypatch.setattr(ssdp, 'SSDP_PORT', responder.getsockname()[1])
+
+        async def respond() -> None:
+            loop = asyncio.get_running_loop()
+            for _ in range(2):
+                _, sender = await loop.sock_recvfrom(responder, 8192)
+                await loop.sock_sendto(
+                    responder,
+                    b'HTTP/1.1 200 OK\r\nLOCATION: http://127.0.0.1/description.xml\r\n\r\n',
+                    sender,
+                )
+
+        async with asyncio.timeout(5), asyncio.TaskGroup() as tasks:
+            tasks.create_task(respond())
+            results = await ssdp.search(timeout=0.1, interface=interface)
+        assert len(results) == 1
+        assert results[0].location == 'http://127.0.0.1/description.xml'
+        assert '192.0.2.123' in caplog.text
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('interface', [None, '0.0.0.0', '192.0.2.123'])
+async def test_search_reports_unavailable_interfaces(monkeypatch: pytest.MonkeyPatch, interface: str | None) -> None:
+    """Report failure when the explicit address or every automatic candidate is unavailable."""
+
+    monkeypatch.setattr(ssdp, '_ipv4_interfaces', lambda: ['192.0.2.123'])
+    with pytest.raises(OSError) as error:
+        await ssdp.search(timeout=0.1, interface=interface)
+    assert error.value.errno == errno.EADDRNOTAVAIL
 
 
 @pytest.mark.anyio
