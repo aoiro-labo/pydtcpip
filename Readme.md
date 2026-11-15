@@ -468,6 +468,9 @@ Check the output for unmasked information before sharing it.
 
 ## Research material
 
+This section examines the relationship between the DTCP-IP specifications and client implementations in the context of interoperability with recording devices owned by the user.  
+The analysis techniques below provide technical background for understanding and verifying those implementations.
+
 ### Why recordings need to be recovered from devices now
 
 In Japanese terrestrial and satellite digital broadcasting, copy controls (Dubbing 10 and Copy Once) apply to almost all programs, including free-to-air broadcasts.  
