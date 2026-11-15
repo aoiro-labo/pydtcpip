@@ -172,12 +172,13 @@ def test_headers_keep_only_known_values() -> None:
 def test_short_unknown_integers_survive_without_retaining_sensitive_fields(kind: str) -> None:
     """Retain small counters in text, CDATA, and attributes, while masking identifiers and personal data."""
 
-    xml = """<root xmlns:shp="urn:schemas-sharp-co-jp:av">
+    xml = """<root xmlns:shp="urn:schemas-sharp-co-jp:av" xmlns:dc="http://purl.org/dc/elements/1.1/">
     <shp:ccnum>10</shp:ccnum><state>0</state><limit><![CDATA[999]]></limit>
     <vendor flag="1" count="123" pin="123" owner="123" deviceID="12" date="123"/>
     <padded>01</padded><large>1000</large><negative>-1</negative><decimal>1.2</decimal>
     <serialNumber>123</serialNumber><title>123</title><friendlyName>123</friendlyName>
     <password>123</password><recordingId>123</recordingId><timestamp>123</timestamp>
+    <dc:identifier>123</dc:identifier><vendorIdentifier value="123"/>
     <owner><value>123</value><part value="123"/></owner><!-- 123 -->
     </root>"""
     # Both supported document kinds use the same rule for unknown vendor metadata
@@ -203,12 +204,16 @@ def test_short_unknown_integers_survive_without_retaining_sensitive_fields(kind:
         'password',
         'recordingId',
         'timestamp',
+        '{http://purl.org/dc/elements/1.1/}identifier',
         'owner/value',
     ):
         assert root.findtext(field) == 'redacted'
     part = root.find('owner/part')
     assert part is not None
     assert part.get('value') == 'redacted'
+    identifier = root.find('vendorIdentifier')
+    assert identifier is not None
+    assert identifier.get('value') == 'redacted'
     assert '<!-- 123 -->' not in redacted
 
 
