@@ -202,3 +202,36 @@ def test_nasne_reports_client_registration_refusal() -> None:
     assert isinstance(error, ClientNotAllowedError)
     assert 'Client Device Management' in str(error)
     assert NASNE.resolve_http_status()(404, 'http://192.0.2.1/2') is None
+
+
+@pytest.mark.parametrize(
+    ('count', 'expected_status', 'expected_value'),
+    [
+        ('10', 'known', 9),
+        ('9', 'known', 8),
+        ('1', 'known', 0),
+        (None, 'omitted', None),
+        ('0', 'unsupported', None),
+        ('redacted', 'unsupported', None),
+    ],
+)
+def test_nasne_copy_count_excludes_the_final_move(
+    count: str | None, expected_status: str, expected_value: int | None
+) -> None:
+    """Expose the remaining copies separately from the final Move and retain the reported value in XML."""
+
+    count_element = '' if count is None else f'<av:COGCount>{count}</av:COGCount>'
+    objects = parse_didl(
+        '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
+        'xmlns:av="urn:schemas-sony-com:av"><item id="test-recording" parentID="0">'
+        f'{count_element}</item></DIDL-Lite>',
+        NASNE,
+    )
+    recording = objects[0]
+    assert isinstance(recording, Recording)
+    remaining = recording.protection.remaining_copy_count
+    assert remaining.status == expected_status
+    assert remaining.value == expected_value
+    assert remaining.source == 'metadata'
+    if count is not None:
+        assert f'>{count}</' in recording.raw_xml

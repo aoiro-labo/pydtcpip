@@ -30,7 +30,7 @@ def _matches(description: DeviceDescription) -> bool:
 
 def _read_remaining_copy_count(item: ET.Element) -> ProtectionValue[int]:
     """
-    Read the remaining copy count from av:COGCount.
+    Read av:COGCount, excluding the final Move from the result.
 
     Args:
         item (ET.Element): Recording's DIDL-Lite item
@@ -39,14 +39,15 @@ def _read_remaining_copy_count(item: ET.Element) -> ProtectionValue[int]:
         ProtectionValue[int]: Copy count and its acquisition status
     """
 
-    # av:COGCount contains the remaining copy count as a decimal; recordings without a count omit the element
-    ## Whether the count includes the final Move, unlike the common field, has not been verified on a device
+    # av:COGCount includes the final Move: Dubbing 10 permits nine copies followed by one Move
+    ## Normalize to the common field so a reported count of one triggers the source-deletion warning
     value = item.findtext(f'{{{_SONY_AV_NAMESPACE}}}COGCount')
     if value is None:
         return ProtectionValue[int](status='omitted', source='metadata')
-    if value.strip().isdecimal() is False:
+    # Zero has no established meaning here; keep it distinct from one remaining Move
+    if value.strip().isdecimal() is False or int(value.strip()) == 0:
         return ProtectionValue[int](status='unsupported', source='metadata')
-    return ProtectionValue[int](status='known', value=int(value.strip()), source='metadata')
+    return ProtectionValue[int](status='known', value=int(value.strip()) - 1, source='metadata')
 
 
 def _interpret_http_status(status: int, url: str) -> PyDTCPIPError | None:

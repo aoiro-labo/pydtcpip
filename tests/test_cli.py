@@ -2,10 +2,12 @@
 
 import asyncio
 import sys
+from html import escape
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
 import pytest
+from aiohttp import web
 from rich.progress import Progress
 from rich.prompt import Confirm, IntPrompt
 from typer.testing import CliRunner
@@ -16,6 +18,75 @@ from pydtcpip.dlna.profiles import GENERIC
 from pydtcpip.events import MoveCompleted, TransferProgressed, TransferReceived, TransferStarted
 from pydtcpip.models import Recording
 from tests.fakes import FakeAuthority, FakeDevice, FakeMediaServer, FakeSourceAKE
+
+
+@pytest.mark.anyio
+async def test_nasne_final_move_warning_before_confirmation(
+    sink_device: FakeDevice, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Read nasne metadata over HTTP and warn before the user declines the final Move."""
+
+    monkeypatch.setenv('PYDTCPIP_CERTIFICATE', sink_device.certificate.hex())
+    monkeypatch.setenv('PYDTCPIP_PRIVATE_KEY', sink_device.private_key.hex())
+    description = """<root xmlns="urn:schemas-upnp-org:device-1-0"><device><modelName>buffalo-nasne</modelName>
+    <serviceList><service><serviceType>urn:schemas-upnp-org:service:ContentDirectory:1</serviceType>
+    <controlURL>/control</controlURL></service></serviceList></device></root>"""
+    didl = """<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"
+    xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:av="urn:schemas-sony-com:av">
+    <item id="recording" parentID="0"><dc:title>Final recording</dc:title><av:COGCount>1</av:COGCount>
+    <res protocolInfo="http-get:*:application/x-dtcp1:DLNA.ORG_CI=0">http://127.0.0.1/unused</res>
+    </item></DIDL-Lite>"""
+
+    async def describe(request: web.Request) -> web.Response:
+        return web.Response(text=description, content_type='text/xml')
+
+    async def browse(request: web.Request) -> web.Response:
+        return web.Response(
+            text='<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>'
+            '<u:BrowseResponse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">'
+            f'<Result>{escape(didl)}</Result><NumberReturned>1</NumberReturned><TotalMatches>1</TotalMatches>'
+            '</u:BrowseResponse></s:Body></s:Envelope>',
+            content_type='text/xml',
+        )
+
+    http_app = web.Application()
+    http_app.router.add_get('/description.xml', describe)
+    http_app.router.add_post('/control', browse)
+    runner = web.AppRunner(http_app)
+    await runner.setup()
+    site = web.TCPSite(runner, '127.0.0.1', 0)
+    await site.start()
+    port = runner.addresses[0][1]
+    output = tmp_path / 'recording.m2ts'
+
+    def invoke() -> str:
+        cli = CliRunner()
+        with cli.isolation(input='n\n') as streams:
+            monkeypatch.setattr(sys.stdin, 'isatty', lambda: True)
+            with pytest.raises(SystemExit) as error:
+                app(
+                    [
+                        '--data-dir',
+                        str(tmp_path),
+                        'move',
+                        str(output),
+                        '--server',
+                        f'http://127.0.0.1:{port}/description.xml',
+                        '--id',
+                        'recording',
+                    ]
+                )
+            assert error.value.code == 1
+            return streams[1].getvalue().decode()
+
+    try:
+        text = await asyncio.to_thread(invoke)
+    finally:
+        await runner.cleanup()
+    assert 'Only the final Move remains.' in text
+    assert 'Moving will delete the source recording.' in text
+    assert text.index('Only the final Move remains.') < text.index('Move this recording and consume')
+    assert output.exists() is False
 
 
 def test_progress_routes_interleaved_transfer_events() -> None:
