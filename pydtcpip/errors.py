@@ -21,6 +21,10 @@ class DLNAError(PyDTCPIPError):
         self.http_status = http_status
 
 
+class UnsupportedActionError(DLNAError):
+    """The device's service description does not advertise the requested optional action."""
+
+
 class ClientNotAllowedError(DLNAError):
     """
     The recorder has not authorized this PC as a media server client.

@@ -33,6 +33,7 @@ async def call_action(
     arguments: dict[str, str],
     *,
     timeout: float,
+    extra_headers: dict[str, str] | None = None,
 ) -> SOAPResult:
     """
     Invoke a UPnP action and return its output arguments.
@@ -44,6 +45,7 @@ async def call_action(
         action (str): Action name
         arguments (dict[str, str]): Input argument names and values, sent in insertion order
         timeout (float): Response timeout in seconds
+        extra_headers (dict[str, str] | None): Additional headers required by an optional service
 
     Returns:
         SOAPResult: Output arguments and response XML
@@ -61,6 +63,8 @@ async def call_action(
         'Content-Type': 'text/xml; charset="utf-8"',
         'SOAPACTION': f'"{service_type}#{action}"',
     }
+    if extra_headers is not None:
+        headers.update(extra_headers)
 
     try:
         async with session.post(

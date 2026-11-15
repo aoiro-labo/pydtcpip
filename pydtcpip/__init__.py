@@ -2,16 +2,26 @@
 
 from pydtcpip.client import DTCPClient
 from pydtcpip.dlna.client import BrowseResult, DLNAClient, MediaServer
+from pydtcpip.dlna.extensions import MetadataExtension, NasneExtension, SonyExtension
+from pydtcpip.dlna.scpd import ServiceArgument, ServiceDescription
 from pydtcpip.dtcp.crypto import DeviceCredentials
 from pydtcpip.dtcp.srm import SRM
 from pydtcpip.errors import ClientNotAllowedError, DLNAError, DTCPError, MoveCommitmentRejectedError, PyDTCPIPError
 from pydtcpip.models import (
+    Chapter,
+    ChapterList,
+    ChapterResource,
     Container,
     MediaInfo,
+    MetadataQuery,
+    MetadataResponse,
+    MetadataValue,
     MoveResumeState,
     ProtectionValue,
     Recording,
+    RecordingMetadata,
     RecordingProtection,
+    ReportedCopyCount,
     Resource,
     TimeRange,
 )
@@ -23,6 +33,9 @@ from pydtcpip.store import DeviceStore
 __all__ = [
     'SRM',
     'BrowseResult',
+    'Chapter',
+    'ChapterList',
+    'ChapterResource',
     'ClientNotAllowedError',
     'Container',
     'DLNAClient',
@@ -35,13 +48,23 @@ __all__ = [
     'FileSink',
     'MediaInfo',
     'MediaServer',
+    'MetadataExtension',
+    'MetadataQuery',
+    'MetadataResponse',
+    'MetadataValue',
     'MoveCommitmentRejectedError',
     'MoveResumeState',
+    'NasneExtension',
     'ProtectionValue',
     'PyDTCPIPError',
     'Recording',
+    'RecordingMetadata',
     'RecordingProtection',
+    'ReportedCopyCount',
     'Resource',
+    'ServiceArgument',
+    'ServiceDescription',
     'Sink',
+    'SonyExtension',
     'TimeRange',
 ]

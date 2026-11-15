@@ -2,19 +2,24 @@
 
 import asyncio
 import logging
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from types import TracebackType
 from typing import Self
+from urllib.parse import urljoin
 
 import aiohttp
 from pydantic import BaseModel, ConfigDict
 
 from pydtcpip.dlna.description import DeviceDescription, ServiceInfo, parse_device_description
 from pydtcpip.dlna.didl import parse_didl
+from pydtcpip.dlna.extensions import MetadataExtension, create_extension
 from pydtcpip.dlna.profiles import Profile, select_profile
+from pydtcpip.dlna.scpd import ServiceDescription, parse_service_description
 from pydtcpip.dlna.soap import SOAPResult, call_action
 from pydtcpip.dlna.ssdp import MEDIA_SERVER_DEVICE_TYPE, search
-from pydtcpip.errors import DLNAError
-from pydtcpip.models import Container, Recording
+from pydtcpip.errors import DLNAError, UnsupportedActionError
+from pydtcpip.models import ChapterList, Container, MetadataQuery, MetadataResponse, Recording, RecordingMetadata
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -58,6 +63,8 @@ class MediaServer:
         self.profile: Profile = select_profile(description)
         self._http_session = http_session
         self._timeout = timeout
+        self.extension: MetadataExtension = create_extension(self)
+        self._service_descriptions: dict[str, ServiceDescription] = {}
 
     @property
     def content_directory(self) -> ServiceInfo:
@@ -131,6 +138,176 @@ class MediaServer:
             raise DLNAError(f'Could not retrieve the item with ID {object_id}.')
         return browse_result.objects[0]
 
+    async def iter_recordings(self, object_id: str | None = None) -> AsyncIterator[Recording]:
+        """
+        Recursively enumerate video items, retaining references and device-provided metadata.
+        Explicit object IDs override the family's dedicated recording containers.
+
+        Args:
+            object_id (str | None): Starting container, or the profile's recording roots
+
+        Yields:
+            Recording: Video item, including live broadcasts advertised by the device
+        """
+
+        pending = list(self.profile.resolve_recording_roots()) if object_id is None else [object_id]
+        visited: set[str] = set()
+        recordings: set[str] = set()
+        while pending:
+            container_id = pending.pop(0)
+            if container_id in visited:
+                continue
+            visited.add(container_id)
+            for item in await self.browse_all(container_id):
+                if isinstance(item, Container):
+                    pending.append(item.id)
+                elif item.upnp_class.startswith('object.item.videoItem'):
+                    # Reference IDs identify duplicates in genre and all-recordings folders
+                    identity = item.reference_id or item.id
+                    if identity not in recordings:
+                        recordings.add(identity)
+                        yield item
+
+    async def get_chapters(self, recording: Recording) -> ChapterList:
+        """
+        Explicitly query optional chapter information through the family extension.
+
+        Args:
+            recording (Recording): Recording to query
+
+        Returns:
+            ChapterList: Device-provided chapter points with source responses
+        """
+
+        return await self.extension.get_chapters(recording)
+
+    async def collect_metadata(self, recording: Recording, *, additional: bool = True) -> RecordingMetadata:
+        """
+        Collect metadata for display or archival before a recording leaves its source.
+        Optional query failures are retained in the result so they cannot erase available metadata.
+
+        Args:
+            recording (Recording): Selected recording and its listing metadata
+            additional (bool): Fetch chapters and family-specific details
+
+        Returns:
+            RecordingMetadata: Available metadata, source responses and explicit query results
+        """
+
+        queries: list[MetadataQuery] = []
+        chapters = ChapterList(status='not_observed')
+        if additional is True:
+            try:
+                chapters = await self.get_chapters(recording)
+                queries.append(MetadataQuery(name='chapters', status=chapters.status))
+            except DLNAError as ex:
+                queries.append(MetadataQuery(name='chapters', status='failed', error=str(ex)))
+            try:
+                queries.extend(await self.extension.get_details(recording))
+            except UnsupportedActionError:
+                queries.append(MetadataQuery(name='recording_details', status='unsupported'))
+            except DLNAError as ex:
+                queries.append(MetadataQuery(name='recording_details', status='failed', error=str(ex)))
+        else:
+            queries.extend(
+                (
+                    MetadataQuery(name='chapters', status='not_observed'),
+                    MetadataQuery(name='recording_details', status='not_observed'),
+                )
+            )
+        return RecordingMetadata(
+            recording=recording,
+            profile=self.profile.name,
+            profile_unverified=self.profile.is_unverified,
+            observed_at=datetime.now(UTC),
+            device_description_xml=self.description.raw_xml,
+            device_location=self.description.location,
+            device_declarations=self.description.extensions,
+            chapters=chapters,
+            queries=tuple(queries),
+            service_descriptions={url: description.raw_xml for url, description in self._service_descriptions.items()},
+        )
+
+    async def fetch_metadata(self, url: str) -> MetadataResponse:
+        """
+        Fetch an optional metadata document using the shared HTTP session.
+
+        Args:
+            url (str): Absolute URL or reference relative to the device description
+
+        Returns:
+            MetadataResponse: Original body, response headers and observation time
+        """
+
+        url = urljoin(self.description.location, url)
+        try:
+            async with self._http_session.get(url, timeout=aiohttp.ClientTimeout(total=self._timeout)) as response:
+                if response.status >= 400:
+                    raise DLNAError(f'Metadata request failed (HTTP {response.status}).', http_status=response.status)
+                return MetadataResponse(
+                    url=str(response.url),
+                    headers=dict(response.headers),
+                    body=await response.read(),
+                    observed_at=datetime.now(UTC),
+                )
+        except DLNAError as ex:
+            raise self.interpret_http_error(ex, url) from ex
+        except (aiohttp.ClientError, TimeoutError) as ex:
+            raise DLNAError(f'Metadata request failed ({ex}).') from ex
+
+    async def get_service_description(self, service: ServiceInfo, *, refresh: bool = False) -> ServiceDescription:
+        """
+        Query the service's advertised actions, caching successful responses in this connection.
+
+        Args:
+            service (ServiceInfo): Service to inspect
+            refresh (bool): Fetch a new response even if a description is cached
+
+        Returns:
+            ServiceDescription: Actions, ordered arguments and original SCPD XML
+        """
+
+        if refresh is False and service.scpd_url in self._service_descriptions:
+            return self._service_descriptions[service.scpd_url]
+        response = await self.fetch_metadata(service.scpd_url)
+        description = parse_service_description(service, response.body.decode('utf-8-sig'))
+        self._service_descriptions[service.scpd_url] = description
+        return description
+
+    async def call_action(
+        self,
+        service: ServiceInfo,
+        action: str,
+        arguments: dict[str, str],
+        *,
+        extra_headers: dict[str, str] | None = None,
+    ) -> SOAPResult:
+        """
+        Invoke an explicitly selected UPnP action through this server's connection.
+
+        Args:
+            service (ServiceInfo): Service with its advertised endpoint and namespace
+            action (str): Action name
+            arguments (dict[str, str]): Input arguments in service-defined order
+            extra_headers (dict[str, str] | None): Optional extension-specific request headers
+
+        Returns:
+            SOAPResult: Output arguments and original response
+        """
+
+        try:
+            return await call_action(
+                self._http_session,
+                service.control_url,
+                service.service_type,
+                action,
+                arguments,
+                timeout=self._timeout,
+                extra_headers=extra_headers,
+            )
+        except DLNAError as ex:
+            raise self.interpret_http_error(ex, service.control_url) from ex
+
     async def browse_metadata(self, object_id: str) -> BrowseResult:
         """
         Fetch a BrowseMetadata response by ID.
@@ -187,13 +364,7 @@ class MediaServer:
             SOAPResult: Action response and output arguments
         """
 
-        service = self.content_directory
-        try:
-            return await call_action(
-                self._http_session, service.control_url, service.service_type, action, arguments, timeout=self._timeout
-            )
-        except DLNAError as ex:
-            raise self.interpret_http_error(ex, service.control_url) from ex
+        return await self.call_action(self.content_directory, action, arguments)
 
     def _browse_result(self, result: SOAPResult) -> BrowseResult:
         """
