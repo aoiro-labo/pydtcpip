@@ -5,6 +5,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 from xml.etree import ElementTree as ET
 
+import pytest
+
 from pydtcpip.dump import Redactor
 
 
@@ -154,6 +156,50 @@ def test_headers_keep_only_known_values() -> None:
     assert '秘密の番組' not in redacted['Content-Disposition']
     assert '2020' not in redacted['Date']
     assert redacted['contentFeatures.dlna.org'] == 'DLNA.ORG_CI=0'
+
+
+@pytest.mark.parametrize('kind', ['didl', 'description'])
+def test_short_unknown_integers_survive_without_retaining_sensitive_fields(kind: str) -> None:
+    """Retain small counters in text, CDATA, and attributes, while masking identifiers and personal data."""
+
+    xml = """<root xmlns:shp="urn:schemas-sharp-co-jp:av">
+    <shp:ccnum>10</shp:ccnum><state>0</state><limit><![CDATA[999]]></limit>
+    <vendor flag="1" count="123" pin="123" owner="123" deviceID="12" date="123"/>
+    <padded>01</padded><large>1000</large><negative>-1</negative><decimal>1.2</decimal>
+    <serialNumber>123</serialNumber><title>123</title><friendlyName>123</friendlyName>
+    <password>123</password><recordingId>123</recordingId><timestamp>123</timestamp>
+    <owner><value>123</value><part value="123"/></owner><!-- 123 -->
+    </root>"""
+    # Both supported document kinds use the same rule for unknown vendor metadata
+    redacted = Redactor().redact_xml(xml, 'didl' if kind == 'didl' else 'description')
+    root = ET.fromstring(redacted)
+    assert root.findtext('{urn:schemas-sharp-co-jp:av}ccnum') == '10'
+    assert root.findtext('state') == '0'
+    assert root.findtext('limit') == '999'
+    vendor = root.find('vendor')
+    assert vendor is not None
+    assert vendor.get('flag') == '1'
+    assert vendor.get('count') == '123'
+    for field in ('pin', 'owner', 'deviceID', 'date'):
+        assert vendor.get(field) == 'redacted'
+    for field in (
+        'padded',
+        'large',
+        'negative',
+        'decimal',
+        'serialNumber',
+        'title',
+        'friendlyName',
+        'password',
+        'recordingId',
+        'timestamp',
+        'owner/value',
+    ):
+        assert root.findtext(field) == 'redacted'
+    part = root.find('owner/part')
+    assert part is not None
+    assert part.get('value') == 'redacted'
+    assert '<!-- 123 -->' not in redacted
 
 
 def test_fixtures_contain_no_private_network_addresses_or_identifiers() -> None:

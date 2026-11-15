@@ -32,7 +32,7 @@ The receiver advertises itself as pydtcpip, not as another manufacturer's device
 
 DBR-Z620 discards its resume state immediately if the control connection drops after it accepts FINALIZE. It also closes unauthenticated connections that send FINALIZE; authenticate normally before retrying finalization or completion. Its copy count can take around 80 seconds to update. REGZA 43Z570L includes broadcast network and service IDs only in BrowseDirectChildren, not BrowseMetadata. Preserve these device-specific behaviors when changing the affected paths.
 
-`dump` saves device responses unchanged by default and requires no credentials. With `--mask-private`, retain only known non-sensitive values, replace embedded identifiers with documentation values, and redact all other values, including unknown elements, attributes, CDATA, comments, URL paths and headers. Keep redacted output usable as test fixtures.
+`dump` saves device responses unchanged by default and requires no credentials. With `--mask-private`, retain known technical values and unknown integers from 0 to 999 without leading zeros, except in fields named as identifiers, credentials, personal data or dates. This integer exception aids compatibility research but does not guarantee anonymity. Replace object IDs and resource URL references consistently, replace embedded identifiers with documentation values, and redact other unknown values, including comments and headers. Apply the same XML value rules to attributes and CDATA. Keep redacted output usable as test fixtures.
 
 ## Implementation and testing
 

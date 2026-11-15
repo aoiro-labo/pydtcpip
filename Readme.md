@@ -464,7 +464,8 @@ Check the output for unmasked information before sharing it.
 
 > [!NOTE]  
 > When submitting an operation report in an [issue](https://github.com/tsukumijima/pydtcpip/issues), please attach logs exported with `--mask-private`.  
-> The `--mask-private` option exports DLNA / UPnP communication logs using an allowlist to retain only technical attributes, masking program titles, broadcast dates and times, device names, and similar information, and replacing UDNs, IP addresses, and MAC addresses with documentation values.  
+> The `--mask-private` option retains known technical attributes and unknown integers from 0 to 999 without leading zeros, which can help identify undocumented counters and status values. Fields named as identifiers, credentials, personal data, or dates are excluded from this integer exception. Program titles, broadcast dates and times, and user-assigned device names are masked; recording IDs and resource URL references receive consistent aliases, while UDNs, IP addresses, and MAC addresses are replaced with documentation values.  
+> Retaining unknown short integers is a diagnostic compromise and does not guarantee anonymity.  
 > Before publishing, please check the contents for any unmasked information as a precaution.
 
 ## Research material

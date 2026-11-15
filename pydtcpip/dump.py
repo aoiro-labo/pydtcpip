@@ -17,8 +17,14 @@ from pydtcpip.models import Container, Recording
 
 _REDACTED_TEXT = 'redacted'
 
-# Retain only values known to be non-sensitive and redact all others
-## Vendor-specific elements and attributes may contain program content in places a denylist cannot anticipate
+# Retain known technical values and short unknown integers for compatibility research
+## Names indicating identifiers, credentials, personal data, or dates exclude the integer exception
+_SHORT_INTEGER_PATTERN = re.compile(r'(?:0|[1-9][0-9]{0,2})')
+_SENSITIVE_NAME_PATTERN = re.compile(
+    r'id$|uuid|udn|serial|password|passwd|pin|secret|token|auth|key|mac|address|owner|user|account|'
+    r'date|time|^(?:start|end)$|title|name|description',
+    re.IGNORECASE,
+)
 
 # DIDL-Lite elements whose text is needed for compatibility and does not identify a program
 _KEPT_DIDL_TEXTS = frozenset(
@@ -169,7 +175,9 @@ class DumpedFile(BaseModel):
 class Redactor:
     """
     Mask identifiers and program content in device responses.
-    Retain only element, attribute, and header values known to be non-sensitive; redact all others.
+    Retain known technical values and unknown integers from 0 to 999 without leading zeros.
+    Exclude fields named as identifiers, credentials, personal data, or dates from the integer exception.
+    Short unknown integers are a diagnostic compromise, not a guarantee of anonymity.
     Replace UUIDs, MAC and IP addresses, and recording timestamps embedded in retained values with documentation values.
     Use consistent replacements so relationships such as shared UDNs and addresses remain traceable.
     Replace XML tokens without rebuilding the document, preserving details such as namespace declaration placement.
@@ -220,7 +228,12 @@ class Redactor:
                 name_match = _TAG_NAME_PATTERN.match(token)
                 local_name = name_match.group(1).rpartition(':')[2] if name_match is not None else ''
                 output.append(
-                    _ATTRIBUTE_PATTERN.sub(lambda attribute: self._redact_attribute(attribute, kept_attributes), token)
+                    _ATTRIBUTE_PATTERN.sub(
+                        lambda attribute: self._redact_attribute(
+                            attribute, kept_attributes, [*element_stack, local_name]
+                        ),
+                        token,
+                    )
                 )
                 if token.endswith('/>') is False:
                     element_stack.append(local_name)
@@ -230,6 +243,7 @@ class Redactor:
             ## Apply the same rule to text before and after child elements
             current = element_stack[-1] if len(element_stack) > 0 else ''
             is_capability = kind == 'description' and current.startswith('X_')
+            text_value = token[9:-3] if is_cdata is True else unescape(token)
             if token.strip() == '':
                 output.append(token)
             elif current in kept_texts or is_capability is True:
@@ -239,6 +253,8 @@ class Redactor:
                     output.append(f'<![CDATA[{masked}]]>' if is_cdata is True else escape(masked, quote=False))
                 else:
                     output.append(self._mask_identifiers(token))
+            elif self._is_short_integer(text_value, element_stack):
+                output.append(token)
             else:
                 leading = token[: len(token) - len(token.lstrip())]
                 trailing = token[len(token.rstrip()) :]
@@ -265,13 +281,16 @@ class Redactor:
                 redacted.append((name, _REDACTED_TEXT))
         return redacted
 
-    def _redact_attribute(self, attribute: re.Match[str], kept_attributes: frozenset[str]) -> str:
+    def _redact_attribute(
+        self, attribute: re.Match[str], kept_attributes: frozenset[str], element_names: list[str]
+    ) -> str:
         """
         Redact an XML attribute unless it is allowed or declares a namespace.
 
         Args:
             attribute (re.Match[str]): Matched attribute and its lexical components
             kept_attributes (frozenset[str]): Local names whose values may be retained
+            element_names (list[str]): Containing element names, including ancestors
 
         Returns:
             str: Attribute with its original quoting and a redacted or masked value
@@ -285,7 +304,11 @@ class Redactor:
             return attribute.group(0)
 
         if local_name not in kept_attributes:
-            value = _REDACTED_TEXT
+            value = (
+                attribute.group('value')
+                if self._is_short_integer(unescape(attribute.group('value')), [*element_names, local_name])
+                else _REDACTED_TEXT
+            )
         elif local_name in ('id', 'parentID', 'refID'):
             value = self._mask_object_id(unescape(attribute.group('value')))
         elif local_name == 'importUri':
@@ -293,6 +316,23 @@ class Redactor:
         else:
             value = self._mask_identifiers(attribute.group('value'))
         return f'{name}{attribute.group("equals")}{attribute.group("quote")}{value}{attribute.group("quote")}'
+
+    @staticmethod
+    def _is_short_integer(value: str, names: list[str]) -> bool:
+        """
+        Check whether an unknown XML value qualifies for the diagnostic integer exception.
+
+        Args:
+            value (str): Decoded XML value
+            names (list[str]): Field and ancestor local names
+
+        Returns:
+            bool: Whether the value can be retained
+        """
+
+        return _SHORT_INTEGER_PATTERN.fullmatch(value.strip()) is not None and all(
+            _SENSITIVE_NAME_PATTERN.search(name) is None for name in names
+        )
 
     def _mask_url(self, text: str) -> str:
         """
