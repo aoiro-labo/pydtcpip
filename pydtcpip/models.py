@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 
 # Protection information acquisition status
@@ -33,6 +33,114 @@ class ProtectionValue[T](BaseModel):
     value: T | None = None
     source: ProtectionSource
     observed_at: datetime | None = None
+
+
+class ReportedCopyCount(BaseModel):
+    """
+    A recorder's copy-count field before normalization to copies excluding the final Move.
+    An unknown counting convention leaves the normalized count unavailable even when the number was read.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    field_name: str
+    raw_value: str
+    status: AcquisitionStatus
+    value: int | None = None
+    is_unlimited: bool = False
+    includes_final_move: bool | None = None
+    resource_url: str | None = None
+    observed_at: datetime | None = None
+
+    @property
+    def remaining_copies(self) -> ProtectionValue[int]:
+        """
+        Normalize the finite count when its counting convention is known.
+
+        Returns:
+            ProtectionValue[int]: Copies excluding the final Move and their acquisition status
+        """
+
+        value = self.value
+        status = self.status
+        if self.is_unlimited is True or self.includes_final_move is None:
+            value = None
+            status = 'unsupported'
+        elif value is not None and self.includes_final_move is True:
+            # A total of zero is not equivalent to one remaining Move
+            if value == 0:
+                value = None
+                status = 'unsupported'
+            else:
+                value -= 1
+        return ProtectionValue[int](status=status, value=value, source='metadata', observed_at=self.observed_at)
+
+
+class MetadataValue(BaseModel):
+    """An XML metadata value with its expanded name and attributes, preserving repeated elements."""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    value: str
+    attributes: dict[str, str] = Field(default_factory=dict)
+
+
+class ChapterResource(BaseModel):
+    """A chapter document referenced by a recording's metadata."""
+
+    model_config = ConfigDict(frozen=True)
+
+    url: str
+    format: Literal['sony', 'panasonic', 'sharp']
+    source_field: str
+
+
+class Chapter(BaseModel):
+    """A device-provided chapter point, optionally converted from a stream position."""
+
+    model_config = ConfigDict(frozen=True)
+
+    position_ms: int | None
+    source_position: int | None = None
+    is_estimated: bool = False
+
+
+class ChapterList(BaseModel):
+    """
+    Chapters and the responses used to obtain them.
+    A successfully retrieved empty list is distinct from missing or unsupported chapter information.
+    """
+
+    model_config = ConfigDict(frozen=True, ser_json_bytes='base64', val_json_bytes='base64')
+
+    status: AcquisitionStatus
+    chapters: tuple[Chapter, ...] = ()
+    sources: tuple[str, ...] = ()
+    raw_responses: tuple[bytes, ...] = ()
+    observed_at: datetime | None = None
+
+
+class MetadataResponse(BaseModel):
+    """An additional HTTP metadata response, retaining its source and observation time."""
+
+    model_config = ConfigDict(frozen=True, ser_json_bytes='base64', val_json_bytes='base64')
+
+    url: str
+    headers: dict[str, str]
+    body: bytes
+    observed_at: datetime
+
+
+class MetadataQuery(BaseModel):
+    """An optional metadata query, distinguishing failed requests from omitted device values."""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    status: Literal['known', 'not_observed', 'omitted', 'unsupported', 'failed']
+    data: dict[str, JsonValue] = Field(default_factory=dict)
+    error: str | None = None
 
 
 class TimeRange(BaseModel):
@@ -117,6 +225,28 @@ class Resource(BaseModel):
     raw_xml: str
 
     @property
+    def duration(self) -> str | None:
+        """
+        Read this resource's duration.
+
+        Returns:
+            str | None: Original duration string, or None when omitted
+        """
+
+        return self.attributes.get('duration')
+
+    @property
+    def resolution(self) -> str | None:
+        """
+        Read this resource's resolution.
+
+        Returns:
+            str | None: Original resolution string, or None when omitted
+        """
+
+        return self.attributes.get('resolution')
+
+    @property
     def size(self) -> int | None:
         """Return the HTTP body size from res@size in bytes (None if absent)."""
 
@@ -146,6 +276,8 @@ class RecordingProtection(BaseModel):
     # Copies remaining on the source, obtained from a recorder-specific element
     ## Like the TV display, this excludes the final Move: 0 means only a Move remains (9 for unused Dubbing 10)
     remaining_copy_count: ProtectionValue[int]
+    # Retain resource-specific values and unknown counting conventions separately from the normalized count
+    reported_copy_counts: tuple[ReportedCopyCount, ...] = ()
     # DTCP.COM_FLAGS bit 31: Move support
     is_move_supported: ProtectionValue[bool]
     # DTCP.COM_FLAGS bit 30: transaction-based Move support
@@ -172,18 +304,34 @@ class Recording(BaseModel):
 
     id: str
     parent_id: str
+    reference_id: str | None = None
     title: str
     upnp_class: str
     description: str | None
     long_description: str | None
     channel_name: str | None
+    channel_number: str | None = None
     genres: tuple[str, ...]
     # Broadcast start and duration as reported by the device (format varies by device)
     date: str | None
+    scheduled_start_time: str | None = None
+    scheduled_end_time: str | None = None
     duration: str | None
+    write_status: str | None = None
+    ratings: tuple[MetadataValue, ...] = ()
+    video_components: tuple[MetadataValue, ...] = ()
+    audio_components: tuple[MetadataValue, ...] = ()
+    broadcast_metadata: tuple[MetadataValue, ...] = ()
+    icons: tuple[MetadataValue, ...] = ()
+    chapter_resources: tuple[ChapterResource, ...] = ()
+    # Family-specific XML elements retain their names and attributes rather than an assumed interpretation
+    vendor_metadata: tuple[MetadataValue, ...] = ()
     resources: tuple[Resource, ...]
     protection: RecordingProtection
     raw_xml: str
+    # Original metadata values before ARIB normalization, serialized as an XML item
+    source_xml: str | None = None
+    observed_at: datetime | None = None
 
     @property
     def original_resource(self) -> Resource | None:
@@ -200,6 +348,25 @@ class Recording(BaseModel):
             if resource.protocol_info.is_converted is None:
                 return resource
         return None
+
+
+class RecordingMetadata(BaseModel):
+    """A recording's metadata archive, independent of the transferred media and resume secrets."""
+
+    model_config = ConfigDict(frozen=True)
+
+    schema_version: int = 1
+    recording: Recording
+    profile: str
+    profile_unverified: bool
+    observed_at: datetime
+    device_description_xml: str | None = None
+    device_location: str | None = None
+    device_declarations: dict[str, str] = Field(default_factory=dict)
+    chapters: ChapterList = Field(default_factory=lambda: ChapterList(status='not_observed'))
+    queries: tuple[MetadataQuery, ...] = ()
+    service_descriptions: dict[str, str] = Field(default_factory=dict)
+    transfer_events: tuple[dict[str, JsonValue], ...] = ()
 
 
 class MediaInfo(BaseModel):

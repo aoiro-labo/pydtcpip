@@ -3,7 +3,7 @@
 from xml.etree import ElementTree as ET
 
 from pydtcpip.dlna.description import DeviceDescription
-from pydtcpip.dlna.profiles.base import Profile
+from pydtcpip.dlna.profiles.base import CopyCountField, Profile
 from pydtcpip.dlna.profiles.generic import GENERIC
 from pydtcpip.errors import ClientNotAllowedError, PyDTCPIPError
 from pydtcpip.models import ProtectionValue
@@ -25,7 +25,7 @@ def _matches(description: DeviceDescription) -> bool:
     """
 
     # Both generations share the nasne metadata format but advertise different model names
-    return description.model_name.lower() in ('nasne', 'buffalo-nasne')
+    return description.model_name.lower() in ('nasne', 'buffalo-nasne', 'buffalo-nasne2')
 
 
 def _read_remaining_copy_count(item: ET.Element) -> ProtectionValue[int]:
@@ -78,4 +78,6 @@ NASNE = Profile(
     matches=_matches,
     read_remaining_copy_count=_read_remaining_copy_count,
     interpret_http_status=_interpret_http_status,
+    copy_count_fields=(CopyCountField(f'{{{_SONY_AV_NAMESPACE}}}COGCount', includes_final_move=True),),
+    extension='nasne',
 )

@@ -173,12 +173,23 @@ def test_generic_profile_handles_standard_dlna_without_vendor_meaning() -> None:
     [
         ('Sony Computer Entertainment Inc.', 'nasne', 'nasne'),
         ('Buffalo Inc.', 'buffalo-nasne', 'nasne'),
-        ('Sony Corporation', 'BDZ-ZW1500', 'generic'),
-        ('Sharp Corporation', 'BD-W2700', 'generic'),
+        ('Buffalo Inc.', 'buffalo-nasne2', 'nasne'),
+        ('Sony Corporation', 'BDZ-ZW1500', 'sony_bdz'),
+        ('Sharp Corporation', 'BD-W2700', 'sharp'),
+        ('Panasonic', 'BD/DVD Recorder', 'panasonic'),
+        ('I-O DATA DEVICE, INC.', 'GV-NTX2', 'recon'),
+        ('I-O DATA DEVICE, INC.', 'RECBOX', 'recbox'),
+        ('Buffalo Inc.', 'LinkStation', 'linkstation'),
+        ('HUMAX', 'IS1050', 'stb'),
+        ('Panasonic', 'STW2000', 'stb_stw2000'),
+        ('Mitsubishi Electric Corporation', 'AM900', 'stb_am900'),
+        ('HUAWEI', 'TT01', 'stb_hikaritv'),
+        ('Example', 'TT01', 'generic'),
+        ('TVS REGZA', '43M550M', 'toshiba_regza_tv'),
     ],
 )
 def test_nasne_model_names_select_a_unique_profile(manufacturer: str, model_name: str, expected_profile: str) -> None:
-    """Recognize both nasne generations while retaining generic handling for other recorders."""
+    """Select a unique family for each supported signature and retain generic negative controls."""
 
     description = parse_device_description(
         'http://192.0.2.1/description.xml',

@@ -3,7 +3,7 @@
 from xml.etree import ElementTree as ET
 
 from pydtcpip.dlna.description import DeviceDescription
-from pydtcpip.dlna.profiles.base import Profile
+from pydtcpip.dlna.profiles.base import CopyCountField, Profile
 from pydtcpip.dlna.profiles.generic import GENERIC
 from pydtcpip.models import ProtectionValue
 
@@ -28,7 +28,8 @@ def _matches(description: DeviceDescription) -> bool:
     """
 
     # Recorders report `TOSHIBA` and REGZA TVs report `TOSHIBA TVS REGZA` as the manufacturer
-    return 'TOSHIBA' in description.manufacturer.upper()
+    manufacturer = description.manufacturer.upper()
+    return 'TOSHIBA' in manufacturer or 'TVS REGZA' in manufacturer
 
 
 def _read_remaining_copy_count(item: ET.Element) -> ProtectionValue[int]:
@@ -64,4 +65,9 @@ TOSHIBA = Profile(
     parent=GENERIC,
     matches=_matches,
     read_remaining_copy_count=_read_remaining_copy_count,
+    copy_count_fields=tuple(
+        CopyCountField(f'{{{namespace}}}copycount', includes_final_move=True)
+        for namespace in _REGZA_METADATA_NAMESPACES
+    ),
+    extension='toshiba',
 )

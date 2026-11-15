@@ -2,11 +2,33 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Literal
 from xml.etree import ElementTree as ET
 
 from pydtcpip.dlna.description import DeviceDescription
 from pydtcpip.errors import PyDTCPIPError
-from pydtcpip.models import ProtectionValue
+from pydtcpip.models import ChapterResource, ProtectionValue, ReportedCopyCount
+
+
+@dataclass(frozen=True)
+class CopyCountField:
+    """Location and counting convention of a family-specific copy-count field."""
+
+    name: str
+    on_resource: bool = False
+    includes_final_move: bool | None = None
+    unlimited_values: tuple[str, ...] = ()
+    is_allowed_use: bool = False
+
+
+@dataclass(frozen=True)
+class ChapterField:
+    """Location and document format of a chapter reference."""
+
+    name: str
+    format: Literal['sony', 'panasonic', 'sharp']
+    on_resource: bool = False
 
 
 @dataclass(frozen=True)
@@ -30,6 +52,136 @@ class Profile:
     interpret_http_status: Callable[[int, str], PyDTCPIPError | None] | None = None
     # Whether BrowseDirectChildren includes fields absent from BrowseMetadata
     has_listing_only_metadata: bool | None = None
+    # New families remain unverified until their behavior has been tested with a device
+    is_unverified: bool = False
+    copy_count_fields: tuple[CopyCountField, ...] | None = None
+    chapter_fields: tuple[ChapterField, ...] | None = None
+    # Communication is implemented by the extension registry, never by a profile
+    extension: str | None = None
+    recording_roots: tuple[str, ...] | None = None
+
+    def resolve_copy_count_fields(self) -> tuple[CopyCountField, ...]:
+        """
+        Resolve copy-count fields through the profile tree.
+
+        Returns:
+            tuple[CopyCountField, ...]: Fields from the nearest family that defines them
+        """
+
+        profile: Profile | None = self
+        while profile is not None:
+            if profile.copy_count_fields is not None:
+                return profile.copy_count_fields
+            profile = profile.parent
+        return ()
+
+    def read_copy_counts(self, item: ET.Element) -> tuple[ReportedCopyCount, ...]:
+        """
+        Read all advertised counts, preserving resource identity and special values.
+
+        Args:
+            item (ET.Element): Recording's DIDL-Lite item
+
+        Returns:
+            tuple[ReportedCopyCount, ...]: Observed fields in profile priority order
+        """
+
+        counts: list[ReportedCopyCount] = []
+        observed_at = datetime.now(UTC)
+        for field in self.resolve_copy_count_fields():
+            elements = (
+                item.findall('{urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/}res') if field.on_resource else [item]
+            )
+            for element in elements:
+                raw_value = element.get(field.name) if field.on_resource else element.findtext(field.name)
+                if raw_value is None:
+                    continue
+                value_text = raw_value.strip()
+                if field.is_allowed_use is True:
+                    parts = value_text.split(':')
+                    value_text = parts[2] if len(parts) == 3 else ''
+                is_unlimited = value_text.casefold() in field.unlimited_values
+                value: int | None = None
+                if is_unlimited is False:
+                    try:
+                        value = int(value_text, 16 if value_text.lower().startswith('0x') else 10)
+                    except ValueError:
+                        # Preserve malformed fields as unsupported observations
+                        value = None
+                    if value is not None and value < 0:
+                        value = None
+                counts.append(
+                    ReportedCopyCount(
+                        field_name=field.name,
+                        raw_value=raw_value,
+                        status='known' if value is not None or is_unlimited is True else 'unsupported',
+                        value=value,
+                        is_unlimited=is_unlimited,
+                        includes_final_move=field.includes_final_move,
+                        resource_url=(element.text or '').strip() if field.on_resource else None,
+                        observed_at=observed_at,
+                    )
+                )
+        return tuple(counts)
+
+    def read_chapter_resources(self, item: ET.Element) -> tuple[ChapterResource, ...]:
+        """
+        Read chapter references without fetching the chapter documents.
+
+        Args:
+            item (ET.Element): Recording's DIDL-Lite item
+
+        Returns:
+            tuple[ChapterResource, ...]: Distinct chapter references in preference order
+        """
+
+        profile: Profile | None = self
+        while profile is not None and profile.chapter_fields is None:
+            profile = profile.parent
+        if profile is None or profile.chapter_fields is None:
+            return ()
+        references: list[ChapterResource] = []
+        for field in profile.chapter_fields:
+            elements = (
+                item.findall('{urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/}res') if field.on_resource else [item]
+            )
+            for element in elements:
+                value = element.get(field.name) if field.on_resource else element.findtext(field.name)
+                if value is not None and value.strip():
+                    reference = ChapterResource(url=value.strip(), format=field.format, source_field=field.name)
+                    if reference not in references:
+                        references.append(reference)
+        return tuple(references)
+
+    def resolve_extension(self) -> str | None:
+        """
+        Resolve the communication extension through the profile tree.
+
+        Returns:
+            str | None: Name of the nearest family's extension, if provided
+        """
+
+        profile: Profile | None = self
+        while profile is not None:
+            if profile.extension is not None:
+                return profile.extension
+            profile = profile.parent
+        return None
+
+    def resolve_recording_roots(self) -> tuple[str, ...]:
+        """
+        Resolve the family's recording containers.
+
+        Returns:
+            tuple[str, ...]: Container IDs, defaulting to the root for recursive browsing
+        """
+
+        profile: Profile | None = self
+        while profile is not None:
+            if profile.recording_roots is not None:
+                return profile.recording_roots
+            profile = profile.parent
+        return ('0',)
 
     @property
     def depth(self) -> int:

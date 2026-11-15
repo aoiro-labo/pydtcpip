@@ -5,7 +5,17 @@ import logging
 from pydtcpip.dlna.description import DeviceDescription
 from pydtcpip.dlna.profiles.base import Profile
 from pydtcpip.dlna.profiles.generic import GENERIC
+from pydtcpip.dlna.profiles.linkstation import LINKSTATION
 from pydtcpip.dlna.profiles.nasne import NASNE
+from pydtcpip.dlna.profiles.panasonic import PANASONIC
+from pydtcpip.dlna.profiles.recbox import RECBOX
+from pydtcpip.dlna.profiles.recon import RECON
+from pydtcpip.dlna.profiles.sharp import SHARP
+from pydtcpip.dlna.profiles.sony_bdz import SONY_BDZ
+from pydtcpip.dlna.profiles.stb import STB
+from pydtcpip.dlna.profiles.stb_am900 import STB_AM900
+from pydtcpip.dlna.profiles.stb_hikaritv import STB_HIKARITV
+from pydtcpip.dlna.profiles.stb_stw2000 import STB_STW2000
 from pydtcpip.dlna.profiles.toshiba import TOSHIBA
 from pydtcpip.dlna.profiles.toshiba_regza_tv import TOSHIBA_REGZA_TV
 
@@ -18,6 +28,16 @@ PROFILES: tuple[Profile, ...] = (
     TOSHIBA,
     TOSHIBA_REGZA_TV,
     NASNE,
+    SONY_BDZ,
+    PANASONIC,
+    SHARP,
+    RECON,
+    RECBOX,
+    LINKSTATION,
+    STB,
+    STB_AM900,
+    STB_HIKARITV,
+    STB_STW2000,
 )
 
 

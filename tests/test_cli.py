@@ -21,20 +21,36 @@ from tests.fakes import FakeAuthority, FakeDevice, FakeMediaServer, FakeSourceAK
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ('model', 'count_field', 'count_attribute'),
+    [
+        ('buffalo-nasne', '<av:COGCount>1</av:COGCount>', ''),
+        ('BD/DVD Recorder', '', 'pxn:CopyCount="1"'),
+        ('STW2000', '', 'allowedUse="0:0:1"'),
+    ],
+)
 async def test_nasne_final_move_warning_before_confirmation(
-    sink_device: FakeDevice, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    sink_device: FakeDevice,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    count_field: str,
+    count_attribute: str,
 ) -> None:
-    """Read nasne metadata over HTTP and warn before the user declines the final Move."""
+    """Read family metadata over HTTP and warn before the user declines the final Move."""
 
     monkeypatch.setenv('PYDTCPIP_CERTIFICATE', sink_device.certificate.hex())
     monkeypatch.setenv('PYDTCPIP_PRIVATE_KEY', sink_device.private_key.hex())
-    description = """<root xmlns="urn:schemas-upnp-org:device-1-0"><device><modelName>buffalo-nasne</modelName>
+    manufacturer = 'Buffalo' if model == 'buffalo-nasne' else 'Panasonic'
+    description = f"""<root xmlns="urn:schemas-upnp-org:device-1-0"><device><modelName>{model}</modelName>
+    <manufacturer>{manufacturer}</manufacturer>
     <serviceList><service><serviceType>urn:schemas-upnp-org:service:ContentDirectory:1</serviceType>
     <controlURL>/control</controlURL></service></serviceList></device></root>"""
-    didl = """<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"
-    xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:av="urn:schemas-sony-com:av">
-    <item id="recording" parentID="0"><dc:title>Final recording</dc:title><av:COGCount>1</av:COGCount>
-    <res protocolInfo="http-get:*:application/x-dtcp1:DLNA.ORG_CI=0">http://127.0.0.1/unused</res>
+    didl = f"""<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"
+    xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:av="urn:schemas-sony-com:av"
+    xmlns:pxn="urn:schemas-panasonic-com:pxn">
+    <item id="recording" parentID="0"><dc:title>Final recording</dc:title>{count_field}
+    <res {count_attribute} protocolInfo="http-get:*:application/x-dtcp1:DLNA.ORG_CI=0">http://127.0.0.1/unused</res>
     </item></DIDL-Lite>"""
 
     async def describe(request: web.Request) -> web.Response:
