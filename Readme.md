@@ -65,12 +65,13 @@ When a recording device serves both the stored format (`DLNA.ORG_CI=0`) and a co
 | --- | --- | --- | --- | --- |
 | Toshiba REGZA 43Z570L | Verified | Verified | Verified | Verified |
 | Toshiba DBR-Z620 | Verified | Verified | Verified | Verified |
-| SIE nasne | Unverified (profile implemented) | Unverified (profile implemented) | Not applicable (the device has no display output) | Unverified (profile implemented) |
+| Sony nasne CECH-ZNR1J | [Reported working](https://github.com/tsukumijima/pydtcpip/issues/3) | Unverified | Unverified | Unverified |
+| Buffalo nasne NS-N100 | [Reported working with the nasne profile](https://github.com/tsukumijima/pydtcpip/issues/4) | Unverified | Unverified | Unverified |
 
 Details of the implemented specification scope and design principles are summarized in [Implemented specifications and design principles](#implemented-specifications-and-design-principles) later in this document.
 
 > [!NOTE]  
-> A device profile (`sie_nasne`) for SIE nasne is also implemented, but its operation is unverified because no physical device is available.
+> Sony and Buffalo nasne share the `nasne` device profile. Community reports confirm recording listings and metadata retrieval on both generations; authentication, streaming, and Move remain unverified.
 
 > [!IMPORTANT]  
 > **DTCP-IP itself is a standard that defines mutual authentication and encrypted transfer, while recording listings and protection information are exchanged through DLNA / UPnP at the preceding stage.**  
@@ -595,7 +596,7 @@ The supported scope and excluded functions are as follows.
 | UPnP / DLNA | SSDP discovery and advertisement / ContentDirectory browsing / CreateObject / DestroyObject / GENA event notifications (on the dubbing receiver side) / `protocolInfo` / `TimeSeekRange` / `X_GetDLNAUploadProfiles` | Recording scheduling / electronic program guide (EPG) / manufacturer-specific conversion preparation for devices / playback control of general-purpose media players |
 | DTCP-IP authentication / cryptography | Full Authentication (ECDSA / ECDH) / IP TTL = 3 restriction / RTT proximity checks / PCP (AES-128-CBC decryption and E-EMI retrieval) / SRM signature verification, revocation checks, and mutual updates | Enhanced Full Authentication / PCP2 / remote access outside the home / DTCP+ |
 | Move / transfer / streaming | Normal streaming (`on_data` backpressure control) / GET Move (`FINALIZE` / `COMPLETE` / `CANCEL` / resume) / POST Move reception (`DubbingReceiver`) | Providing a playback streaming server as a DTCP Source |
-| Device compatibility | Handling metadata and HTTP status differences through an inheritable profile tree (`generic` → `toshiba` → `toshiba_regza_tv`, and `generic` → `sie_nasne`) | Proprietary extensions of unverified models (supported by adding profiles based on real-device responses) |
+| Device compatibility | Handling metadata and HTTP status differences through an inheritable profile tree (`generic` → `toshiba` → `toshiba_regza_tv`, and `generic` → `nasne`) | Proprietary extensions of unverified models (supported by adding profiles based on real-device responses) |
 
 The implementation is designed to follow the publicly available DTCP V1 / V1SE, DLNA, and ARIB specifications and real-device behavior as faithfully as possible.
 

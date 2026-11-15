@@ -5,7 +5,7 @@ import logging
 from pydtcpip.dlna.description import DeviceDescription
 from pydtcpip.dlna.profiles.base import Profile
 from pydtcpip.dlna.profiles.generic import GENERIC
-from pydtcpip.dlna.profiles.sie_nasne import SIE_NASNE
+from pydtcpip.dlna.profiles.nasne import NASNE
 from pydtcpip.dlna.profiles.toshiba import TOSHIBA
 from pydtcpip.dlna.profiles.toshiba_regza_tv import TOSHIBA_REGZA_TV
 
@@ -17,7 +17,7 @@ PROFILES: tuple[Profile, ...] = (
     GENERIC,
     TOSHIBA,
     TOSHIBA_REGZA_TV,
-    SIE_NASNE,
+    NASNE,
 )
 
 

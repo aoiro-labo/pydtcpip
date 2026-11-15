@@ -8,7 +8,7 @@ import pytest
 from pydtcpip.dlna.description import parse_device_description
 from pydtcpip.dlna.didl import parse_didl
 from pydtcpip.dlna.profiles import GENERIC, PROFILES, select_profile
-from pydtcpip.dlna.profiles.sie_nasne import SIE_NASNE
+from pydtcpip.dlna.profiles.nasne import NASNE
 from pydtcpip.errors import ClientNotAllowedError
 from pydtcpip.models import Recording
 
@@ -168,9 +168,37 @@ def test_generic_profile_handles_standard_dlna_without_vendor_meaning() -> None:
     assert profile.resolve_http_status()(403, 'http://192.0.2.1/2') is None
 
 
-def test_sie_nasne_reports_client_registration_refusal() -> None:
+@pytest.mark.parametrize(
+    ('manufacturer', 'model_name', 'expected_profile'),
+    [
+        ('Sony Computer Entertainment Inc.', 'nasne', 'nasne'),
+        ('Buffalo Inc.', 'buffalo-nasne', 'nasne'),
+        ('Sony Corporation', 'BDZ-ZW1500', 'generic'),
+        ('Sharp Corporation', 'BD-W2700', 'generic'),
+    ],
+)
+def test_nasne_model_names_select_a_unique_profile(manufacturer: str, model_name: str, expected_profile: str) -> None:
+    """Recognize both nasne generations while retaining generic handling for other recorders."""
+
+    description = parse_device_description(
+        'http://192.0.2.1/description.xml',
+        '<root xmlns="urn:schemas-upnp-org:device-1-0"><device>'
+        '<deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>'
+        f'<manufacturer>{manufacturer}</manufacturer><modelName>{model_name}</modelName>'
+        '<UDN>uuid:00000000-0000-0000-0000-000000000001</UDN></device></root>',
+    )
+    profile = select_profile(description)
+    assert profile.name == expected_profile
+    deepest_matches = []
+    for candidate in PROFILES:
+        if candidate.depth == profile.depth and candidate.is_match(description) is True:
+            deepest_matches.append(candidate.name)
+    assert deepest_matches == [expected_profile]
+
+
+def test_nasne_reports_client_registration_refusal() -> None:
     # Distinguish nasne's 403 from authentication failures so users can find client registration
-    error = SIE_NASNE.resolve_http_status()(403, 'http://192.0.2.1/2')
+    error = NASNE.resolve_http_status()(403, 'http://192.0.2.1/2')
     assert isinstance(error, ClientNotAllowedError)
     assert 'Client Device Management' in str(error)
-    assert SIE_NASNE.resolve_http_status()(404, 'http://192.0.2.1/2') is None
+    assert NASNE.resolve_http_status()(404, 'http://192.0.2.1/2') is None

@@ -1,4 +1,4 @@
-"""Profile for nasne devices sold by SIE."""
+"""Shared profile for nasne devices sold by Sony and Buffalo."""
 
 from xml.etree import ElementTree as ET
 
@@ -15,17 +15,17 @@ _SONY_AV_NAMESPACE = 'urn:schemas-sony-com:av'
 
 def _matches(description: DeviceDescription) -> bool:
     """
-    Match the model name reported by SIE's nasne.
+    Match the model names reported by Sony and Buffalo nasne devices.
 
     Args:
         description (DeviceDescription): Device description to inspect
 
     Returns:
-        bool: True when the model name is nasne
+        bool: True when the model name identifies a nasne
     """
 
-    # SIE's nasne reports `nasne` as its model name (other vendors use different names)
-    return description.model_name.lower() == 'nasne'
+    # Both generations share the nasne metadata format but advertise different model names
+    return description.model_name.lower() in ('nasne', 'buffalo-nasne')
 
 
 def _read_remaining_copy_count(item: ET.Element) -> ProtectionValue[int]:
@@ -71,8 +71,8 @@ def _interpret_http_status(status: int, url: str) -> PyDTCPIPError | None:
     return None
 
 
-SIE_NASNE = Profile(
-    name='sie_nasne',
+NASNE = Profile(
+    name='nasne',
     parent=GENERIC,
     matches=_matches,
     read_remaining_copy_count=_read_remaining_copy_count,
