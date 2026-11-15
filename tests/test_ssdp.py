@@ -100,10 +100,13 @@ async def test_search_skips_unavailable_addresses(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize('interface', [None, '0.0.0.0', '192.0.2.123'])
-async def test_search_reports_unavailable_interfaces(monkeypatch: pytest.MonkeyPatch, interface: str | None) -> None:
+@pytest.mark.parametrize('addresses', [[], ['192.0.2.123']])
+async def test_search_reports_unavailable_interfaces(
+    monkeypatch: pytest.MonkeyPatch, interface: str | None, addresses: list[str]
+) -> None:
     """Report failure when the explicit address or every automatic candidate is unavailable."""
 
-    monkeypatch.setattr(ssdp, '_ipv4_interfaces', lambda: ['192.0.2.123'])
+    monkeypatch.setattr(ssdp, '_ipv4_interfaces', lambda: addresses)
     with pytest.raises(OSError) as error:
         await ssdp.search(timeout=0.1, interface=interface)
     assert error.value.errno == errno.EADDRNOTAVAIL

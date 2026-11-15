@@ -158,8 +158,10 @@ async def search(
                 raise
             transports.append(transport)
         # Surface the address error when automatic discovery has no usable network
-        if len(transports) == 0 and unavailable_error is not None:
-            raise unavailable_error
+        if len(transports) == 0:
+            if unavailable_error is not None:
+                raise unavailable_error
+            raise OSError(errno.EADDRNOTAVAIL, 'No IPv4 interface is available for SSDP discovery.')
         # Devices respond at any time within MX seconds, so send twice with a delay to reduce missed responses
         mx = max(1, min(5, int(timeout) - 1))
         message = (
