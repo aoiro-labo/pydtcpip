@@ -217,6 +217,7 @@ class FakeSourceAKE:
         self.errors: list[str] = []
         self.completed = asyncio.Event()
         self.cancelled = asyncio.Event()
+        self.disconnected = asyncio.Event()
 
         # Number of accepted finalize requests whose responses are dropped
         self.drop_finalize_responses = 0
@@ -274,6 +275,7 @@ class FakeSourceAKE:
             writer (asyncio.StreamWriter): Control connection writer
         """
 
+        self.disconnected.clear()
         is_move = False
         try:
             while True:
@@ -340,6 +342,7 @@ class FakeSourceAKE:
             self.errors.append(f'{type(ex).__name__}: {ex}')
         finally:
             writer.close()
+            self.disconnected.set()
 
     async def _authenticate(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, challenge: _Frame, *, is_move: bool

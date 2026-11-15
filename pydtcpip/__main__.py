@@ -1,10 +1,12 @@
 """CLI for discovering devices and recordings, streaming, Move, incoming transfers, and response dumps."""
 
 import asyncio
+import json
 import logging
 import os
 import sys
 from collections.abc import Coroutine
+from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Annotated
@@ -50,7 +52,17 @@ from pydtcpip.events import (
     TransferReceived,
     TransferStarted,
 )
-from pydtcpip.models import Container, MoveResumeState, ProtectionValue, Recording, Resource, TimeRange
+from pydtcpip.metadata import MetadataSidecar
+from pydtcpip.models import (
+    Container,
+    MetadataQuery,
+    MoveResumeState,
+    ProtectionValue,
+    Recording,
+    RecordingMetadata,
+    Resource,
+    TimeRange,
+)
 from pydtcpip.receiver import DubbingReceiver
 from pydtcpip.sinks import FileSink
 from pydtcpip.store import DeviceStore
@@ -290,7 +302,7 @@ async def _select_server(dlna: DLNAClient, location: str | None) -> MediaServer:
             server.description.friendly_name,
             server.description.manufacturer,
             server.description.model_name,
-            server.profile.name,
+            f'{server.profile.name} (unverified)' if server.profile.is_unverified else server.profile.name,
         )
     console.print(table)
     choice = IntPrompt.ask(
@@ -360,7 +372,7 @@ async def _select_recording(server: MediaServer, object_id: str | None) -> Recor
                     'Channel' if _is_broadcast(item) is True else 'Recording',
                     item.title,
                     item.date or '',
-                    _format_protection(item.protection.remaining_copy_count),
+                    _format_recording_copy_count(item),
                 )
         console.print(table)
         choice = IntPrompt.ask('Number', console=console, choices=[str(index) for index in range(1, len(objects) + 1)])
@@ -403,6 +415,31 @@ def _choose_resource(recording: Recording) -> Resource:
     return resource
 
 
+def _format_recording_copy_count(recording: Recording) -> str:
+    """
+    Show normalized copies or the original value when its counting convention is unknown.
+
+    Args:
+        recording (Recording): Recording to display
+
+    Returns:
+        str: Copy count with any unresolved counting convention
+    """
+
+    count = recording.protection.remaining_copy_count
+    if count.status == 'known':
+        return _format_protection(count)
+    original = recording.original_resource
+    for reported in recording.protection.reported_copy_counts:
+        if reported.resource_url is not None and (original is None or reported.resource_url != original.url):
+            continue
+        if reported.is_unlimited is True:
+            return 'Unlimited (device report)'
+        if reported.value is not None:
+            return f'Unknown (device reports {reported.raw_value})'
+    return _format_protection(count)
+
+
 def _print_recording(recording: Recording) -> None:
     """
     Display recording metadata and protection information.
@@ -418,11 +455,42 @@ def _print_recording(recording: Recording) -> None:
     table.add_row('Date', recording.date or 'Not reported by device')
     table.add_row('Duration', recording.duration or 'Not reported by device')
     table.add_row('Channel', recording.channel_name or 'Not reported by device')
-    table.add_row(
-        'Copies remaining (recording metadata)', _format_protection(recording.protection.remaining_copy_count)
-    )
+    if recording.description:
+        table.add_row('Description', recording.description)
+    if recording.long_description:
+        table.add_row('Program details', recording.long_description)
+    if recording.genres:
+        table.add_row('Genres', ', '.join(recording.genres))
+    if recording.scheduled_start_time is not None:
+        table.add_row('Scheduled start', recording.scheduled_start_time)
+    if recording.scheduled_end_time is not None:
+        table.add_row('Scheduled end', recording.scheduled_end_time)
+    if recording.channel_number is not None:
+        table.add_row('Channel number', recording.channel_number)
+    if recording.write_status is not None:
+        table.add_row('Write status', recording.write_status)
+    for label, values in (
+        ('Parental rating', recording.ratings),
+        ('Video components', recording.video_components),
+        ('Audio components', recording.audio_components),
+        ('Broadcast information', recording.broadcast_metadata),
+        ('Device metadata', recording.vendor_metadata),
+    ):
+        for value in values:
+            attributes = ', '.join(f'{name.rpartition("}")[2]}={text}' for name, text in value.attributes.items())
+            text = value.value + (f' ({attributes})' if attributes else '')
+            field = value.name.rpartition('}')[2]
+            table.add_row(f'{label} ({field})', text)
+    table.add_row('Copies remaining (recording metadata)', _format_recording_copy_count(recording))
     table.add_row('Move support (protocolInfo)', _format_protection(recording.protection.is_move_supported))
     table.add_row('Transfer copy control', 'Available after transfer starts')
+    for count in recording.protection.reported_copy_counts:
+        convention = 'Final Move convention unknown'
+        if count.is_unlimited is True:
+            convention = 'Reported as unlimited'
+        elif count.includes_final_move is not None:
+            convention = 'Includes final Move' if count.includes_final_move else 'Excludes final Move'
+        table.add_row(f'Reported count ({count.field_name.rpartition("}")[2]})', f'{count.raw_value} ({convention})')
     for index, resource in enumerate(recording.resources, start=1):
         converted = {True: 'Converted', False: 'Original format', None: 'Unknown'}[resource.protocol_info.is_converted]
         # Profile names can use DLNA.ORG_PN, DLPA.JP_PN, or a vendor namespace such as TOSHIBA.CO.JP_PN
@@ -430,19 +498,94 @@ def _print_recording(recording: Recording) -> None:
             (value for name, value in resource.protocol_info.parameters.items() if name.endswith('_PN')), ''
         )
         table.add_row(f'Resource {index}', f'{converted} {profile_name}')
+        for label, value in (
+            ('Duration', resource.duration),
+            ('Resolution', resource.resolution),
+            ('HTTP size (bytes)', resource.size),
+            ('Content size (bytes)', resource.cleartext_size),
+        ):
+            if value is not None:
+                table.add_row(f'Resource {index}: {label}', str(value))
     console.print(table)
+
+
+def _print_additional_metadata(metadata: RecordingMetadata) -> None:
+    """
+    Display optional metadata and acquisition failures alongside recording details.
+
+    Args:
+        metadata (RecordingMetadata): Metadata collected for the selected recording
+    """
+
+    chapters = metadata.chapters
+    if chapters.status == 'known':
+        table = Table(title='Chapters (device behavior unverified)')
+        table.add_column('Position (ms)')
+        table.add_column('Timing')
+        for chapter in chapters.chapters:
+            timing = 'Estimated' if chapter.is_estimated else 'Device-provided'
+            if chapter.position_ms is None:
+                timing = f'Time unavailable; source position {chapter.source_position}'
+            table.add_row(str(chapter.position_ms) if chapter.position_ms is not None else 'Unknown', timing)
+        console.print(table)
+    for query in metadata.queries:
+        if query.status == 'failed':
+            console.print(f'[yellow]Could not retrieve {query.name}: {query.error}[/yellow]')
+        elif query.status == 'known' and query.data:
+            table = Table(title=query.name.replace('_', ' ').title(), show_header=False)
+            table.add_column('Field')
+            table.add_column('Value')
+            # Show selected recording fields; complete response documents remain in the JSON archive
+            selected = query.data.get('recording')
+            items = [selected] if isinstance(selected, dict) else query.data.get('items', [])
+            if isinstance(items, list):
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    fields = item.get('fields')
+                    if isinstance(fields, list):
+                        for field in fields:
+                            if isinstance(field, dict):
+                                name = str(field.get('name', '')).rpartition('}')[2]
+                                table.add_row(name, Text(str(field.get('value', ''))))
+                    else:
+                        for name, value in item.items():
+                            text = (
+                                json.dumps(value, ensure_ascii=False) if isinstance(value, (list, dict)) else str(value)
+                            )
+                            table.add_row(name, Text(text))
+            console.print(table)
 
 
 class ProgressReporter:
     """Report transfer events through a Rich progress bar and logs."""
 
-    def __init__(self, progress: Progress, description: str) -> None:
+    def __init__(self, progress: Progress, description: str, sidecar: MetadataSidecar | None = None) -> None:
+        """
+        Attach progress reporting and optional metadata persistence to a transfer.
+
+        Args:
+            progress (Progress): Progress display
+            description (str): Label for the transfer
+            sidecar (MetadataSidecar | None): Metadata archive associated with the transfer
+        """
+
         self._progress = progress
         self._description = description
+        self._sidecar = sidecar
         # Keep each transfer's task and byte counter separate in the long-running receiver
         self._tasks: dict[str, tuple[TaskID, bool]] = {}
 
     def __call__(self, event: TransferEvent) -> None:
+        """
+        Save relevant metadata and update the transfer display.
+
+        Args:
+            event (TransferEvent): Transfer or authentication event
+        """
+
+        if self._sidecar is not None:
+            self._sidecar.on_event(event)
         if isinstance(event, AuthenticationStarted):
             _LOGGER.info(
                 f'Starting mutual authentication: {event.host}:{event.port}'
@@ -629,7 +772,7 @@ def discover(
                 server.description.friendly_name,
                 server.description.manufacturer,
                 server.description.model_name,
-                server.profile.name,
+                f'{server.profile.name} (unverified)' if server.profile.is_unverified else server.profile.name,
                 server.description.location,
             )
         console.print(table)
@@ -641,9 +784,15 @@ def discover(
 def info(
     server: ServerOption = None,
     object_id: Annotated[str | None, typer.Option('--id', help='Recording ID')] = None,
+    additional: Annotated[
+        bool, typer.Option('--additional/--basic', help='Query optional chapters and recording details')
+    ] = True,
+    json_output: Annotated[
+        bool, typer.Option('--json', help='Write complete metadata as JSON to standard output')
+    ] = False,
     verbose: VerboseOption = False,
 ) -> None:
-    """Show recording details and protection information available from the listing."""
+    """Show recording metadata, with optional additional chapter queries."""
 
     _setup_logging(verbose)
 
@@ -651,7 +800,17 @@ def info(
         async with DLNAClient() as dlna:
             media_server = await _select_server(dlna, server)
             recording = await _select_recording(media_server, object_id)
-            _print_recording(recording)
+            with console.status('Fetching recording metadata...'):
+                metadata = await media_server.collect_metadata(recording, additional=additional)
+            if json_output is True:
+                print(metadata.model_dump_json(indent=2))
+            else:
+                profile_label = media_server.profile.name
+                if media_server.profile.is_unverified is True:
+                    profile_label += ' (device behavior unverified)'
+                console.print(f'Profile: {profile_label}')
+                _print_recording(recording)
+                _print_additional_metadata(metadata)
 
     _execute(main())
 
@@ -750,9 +909,10 @@ def move(
     device_credentials = _load_credentials(credentials)
     resume_path = _resume_state_path(output)
     metadata_path = output.with_suffix('.xml')
-    if output.exists() is True or resume_path.exists() is True or metadata_path.exists() is True:
+    json_metadata_path = output.with_suffix('.metadata.json')
+    if output.exists() or resume_path.exists() or metadata_path.exists() or json_metadata_path.exists():
         console.print(
-            f'[red]The output, program metadata XML, or previous Move resume state already exists: {output}[/red]'
+            f'[red]The output, metadata sidecar, or previous Move resume state already exists: {output}[/red]'
         )
         raise typer.Exit(1)
 
@@ -805,10 +965,13 @@ def move(
                 ):
                     raise typer.Exit(1)
 
-            # Some recorders omit program information from the SIT, so save DIDL-Lite metadata beside the recording
-            ## Write it before the Move in the same format as receive
-            if recording is not None:
-                metadata_path.write_text(recording.raw_xml, encoding='utf-8')
+            # Query and persist optional metadata before the source can delete the recording
+            sidecar: MetadataSidecar | None = None
+            if recording is not None and media_server is not None:
+                with console.status('Fetching recording metadata...'):
+                    metadata = await media_server.collect_metadata(recording)
+                _print_additional_metadata(metadata)
+                sidecar = MetadataSidecar(output, metadata)
 
             sink = FileSink(output)
             try:
@@ -817,7 +980,7 @@ def move(
                         target,
                         sink,
                         on_resume_state=lambda state: _save_resume_state(resume_path, state),
-                        on_event=ProgressReporter(progress, 'Move'),
+                        on_event=ProgressReporter(progress, 'Move', sidecar),
                     )
             except DLNAError as ex:
                 if media_server is not None:
@@ -886,6 +1049,16 @@ def resume(
         console.print(f'[red]Could not load Move resume state: {resume_path} ({ex})[/red]')
         raise typer.Exit(1) from ex
 
+    # Optional metadata must not prevent recovery after the source may have consumed a copy
+    sidecar: MetadataSidecar | None = None
+    try:
+        sidecar = MetadataSidecar.resume(output)
+    except (ValidationError, OSError) as ex:
+        _LOGGER.warning(
+            f'Could not load recording metadata beside {output}; continuing Move recovery without metadata updates.',
+            exc_info=ex,
+        )
+
     async def main() -> None:
         # If finalization was verified and data is already in place, retry only the completion notification
         sink: FileSink | None = None
@@ -900,7 +1073,7 @@ def resume(
                         resume_state,
                         sink,
                         on_resume_state=lambda state: _save_resume_state(resume_path, state),
-                        on_event=ProgressReporter(progress, 'Move'),
+                        on_event=ProgressReporter(progress, 'Move', sidecar),
                     )
             except MoveCommitmentRejectedError as ex:
                 _print_commitment_rejected(ex, output)
@@ -934,18 +1107,66 @@ def receive(
     directory = directory.resolve()
     directory.mkdir(parents=True, exist_ok=True)
 
+    sidecars: dict[str, MetadataSidecar] = {}
+
     def create_sink(recording: Recording) -> FileSink:
-        # Save program metadata XML beside the recording
+        """
+        Save the incoming metadata and prepare a media file.
+
+        Args:
+            recording (Recording): Metadata supplied by the sender
+
+        Returns:
+            FileSink: Media destination
+        """
+
+        # Incoming transfers provide their original CreateObject metadata, but no discoverable source endpoint
         output = _dubbing_output_path(directory, recording)
-        output.with_suffix('.xml').write_text(recording.raw_xml, encoding='utf-8')
+        sink = FileSink(output)
+        # Preserve metadata for completed media and for full data retained for finalization recovery
+        if output.exists() is True or sink.pending_path.exists() is True:
+            raise FileExistsError(f'Received recording data already exists beside {output}.')
+        # The sender can retry the same registered upload after its incomplete media has been discarded
+        sidecar = MetadataSidecar.resume(output)
+        if sidecar is None:
+            sidecar = MetadataSidecar(
+                output,
+                RecordingMetadata(
+                    recording=recording,
+                    profile='generic',
+                    profile_unverified=False,
+                    observed_at=datetime.now(UTC),
+                    queries=(MetadataQuery(name='source_details', status='not_observed'),),
+                ),
+            )
+        elif sidecar.metadata.recording.id != recording.id:
+            raise FileExistsError(f'Metadata for a different recording already exists beside {output}.')
+        sidecars[recording.id] = sidecar
+        _print_recording(recording)
         console.print(f'Incoming transfer accepted: {recording.title} -> {output}')
-        return FileSink(output)
+        return sink
 
     def save_resume_state(recording: Recording, state: MoveResumeState | None) -> None:
         # Save resume state beside the output, as in move, so `pydtcpip resume <output>` can resume finalization
         _save_resume_state(_resume_state_path(_dubbing_output_path(directory, recording)), state)
 
     progress = _new_progress()
+    reporter = ProgressReporter(progress, 'Receiving')
+
+    def on_event(event: TransferEvent) -> None:
+        """
+        Append transfer metadata and update the receiver's progress display.
+
+        Args:
+            event (TransferEvent): Incoming transfer event
+        """
+
+        sidecar = sidecars.get(event.transfer_id)
+        if sidecar is not None:
+            sidecar.on_event(event)
+            if isinstance(event, (MoveCompleted, MoveCancelled, MoveFinalizeRejected, MoveResumeRequired)):
+                sidecars.pop(event.transfer_id)
+        reporter(event)
 
     async def main() -> None:
         receiver = DubbingReceiver(
@@ -958,7 +1179,7 @@ def receive(
             srm=_device_store.load_srm(),
             on_srm_update=_device_store.save_srm,
             on_resume_state=save_resume_state,
-            on_event=ProgressReporter(progress, 'Receiving'),
+            on_event=on_event,
         )
         await receiver.start()
         console.print('Listening. Select this destination on the recorder. Press Ctrl+C to stop.')

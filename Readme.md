@@ -73,6 +73,25 @@ Details of the implemented specification scope and design principles are summari
 > [!NOTE]  
 > Sony and Buffalo nasne share the `nasne` device profile. Community reports confirm recording listings and metadata retrieval on both generations; authentication, streaming, and Move remain unverified.
 
+**Additional device profiles provide metadata parsing and optional recording-detail queries for the following families. Their device behavior remains unverified.**  
+Discovery and recording details display these profiles as unverified; the table above records actual transfer verification separately.
+
+| Family | Profile | Metadata support |
+| --- | --- | --- |
+| Sony BDZ | `sony_bdz` | Copy counts, chapter URLs, recording details, actual recording start and storage information from advertised services |
+| Panasonic DIGA / VIERA | `panasonic` | Resource copy counts, chapter URLs and Panasonic extension fields |
+| Sharp AQUOS | `sharp` | Copy counts, chapter URLs and Sharp extension fields |
+| I-O DATA REC-ON | `recon` | Resource copy counts and chapters through an advertised tag action |
+| I-O DATA RECBOX | `recbox` | Recorder-specific copy-count fields and chapter references retained by the server |
+| Buffalo LinkStation | `linkstation` | Recorder-specific copy-count fields and chapter references retained by the server |
+| Cable / satellite set-top boxes | `stb` | Resource copy counts, advertised chapter tags and compatible recording-detail services |
+| Compatible Hikari TV boxes | `stb_hikaritv` | Set-top box metadata and the dedicated recording container |
+| STW2000 | `stb_stw2000` | Set-top box metadata and the STW2000 recording container |
+| AM900 | `stb_am900` | Set-top box metadata and the AM900 recording container |
+
+Existing Toshiba profiles also support hexadecimal copy counts and optional chapter queries. The nasne profile additionally supports recording details and chapter positions.  
+These new queries remain unverified on hardware, including devices with previously verified basic operations. nasne chapter times are estimates derived from thumbnail positions; the original positions are retained, including points that cannot be converted to a time.
+
 > [!IMPORTANT]  
 > **DTCP-IP itself is a standard that defines mutual authentication and encrypted transfer, while recording listings and protection information are exchanged through DLNA / UPnP at the preceding stage.**  
 > However, **the details of this preceding stage depend heavily on manufacturer- and model-specific extensions; for example, even the field names for the remaining Dubbing 10 copy count are not standardized across manufacturers.** Even commercial recorders frequently encounter interoperability problems with each other.  
@@ -200,6 +219,17 @@ Number [1/2]: 1
 └───────────────────────────────────────┴─────────────────────────────────────────────────────────┘
 ```
 
+`info` also displays scheduled broadcast times, video/audio information, original copy-count values and available chapters. Sony-compatible services and nasne can supply additional recording details.  
+Optional queries run by default; a failed query is reported while the available program information remains visible. Use `--basic` to read only the ordinary listing, or `--json` to export the collected metadata, source responses and query statuses.
+
+```bash
+pydtcpip info --basic
+pydtcpip info --json --server http://192.0.2.20:5000/description.xml --id RECORDING_ID
+```
+
+Finite copy counts are displayed excluding the final Move: a device count of 10 becomes nine copies, and a count of 1 means only the final Move remains.  
+The original field and value are also retained. Missing values remain unknown, and unlimited-copy markers are kept separate from finite counts.
+
 ### 3. Saving recordings from a PC through Move transfers
 
 **The `move` subcommand connects to the recording device as a client and saves the entire recording through a GET Move operation.**  
@@ -213,9 +243,9 @@ $ pydtcpip move recording.m2ts
 > **Some recording device models do not store program information or time information in the SIT (Selection Information Table) of MPEG2-TS recordings (partial TS).**  
 > This information generally appears to be stored in recordings made on REGZA TVs.
 > 
-> To keep metadata such as program information accessible after dubbing, **the program information XML (DIDL-Lite format) retrieved through DLNA for the recording is saved alongside the recorded data (`.m2ts`) as `(recording filename).xml` at the same time.**  
-> For example, if you specify `recording.m2ts` as the saved filename, the XML is saved as `recording.xml` in the same directory.  
-> The information stored in the program information XML varies by recording device (model-dependent).
+> **The CLI saves program information as XML and JSON sidecars before transferring the recording.**  
+> For `recording.m2ts`, these files are `recording.xml` and `recording.metadata.json` in the same directory. The JSON also contains available chapters, additional recording details and their acquisition status.  
+> The available information depends on the device; see [Received data format and metadata](#received-data-format-and-metadata) for the contents of each file.
 
 > [!WARNING]  
 > **A Move operation consumes one copy from the source's copy count.**  
@@ -259,7 +289,8 @@ $ pydtcpip receive recordings --source 192.0.2.20
 Once the server starts, use the recording device's remote control to select the recorded program for dubbing on its screen, then select "pydtcpip" as the dubbing destination and start dubbing.  
 
 > [!NOTE]  
-> **Received recordings are saved as `.m2ts`, and program information XML retrieved through DLNA (DIDL-Lite format, described above) is saved as `.xml`, in the specified directory.**  
+> **Received recordings are saved as `.m2ts`, with program metadata in `.xml` and `.metadata.json` sidecars in the specified directory.**  
+> Incoming transfers preserve the metadata supplied by the sender, including its original XML. Additional source queries require a discovered media server and are available through `info` and client-initiated `move`.  
 > The program title provided through DLNA is normally used as the filename.  
 > To stop the server from listening, press Ctrl+C.
 
@@ -308,7 +339,7 @@ $ pydtcpip stream --server http://192.0.2.20:5000/description.xml --id RECORDING
 
 > [!NOTE]  
 > If the URL of the served resource is known, you can also specify it directly, as in `stream URL` or `move recording.m2ts --url URL --yes`.  
-> When you specify a URL directly, the DLNA recording listing is not retrieved, so neither the program information `.xml` nor the remaining copy count from metadata is retrieved.  
+> When you specify a URL directly, the DLNA recording listing is not retrieved, so program metadata sidecars and the remaining copy count from metadata are unavailable.  
 
 ### 7. Firewall and network settings
 
@@ -387,6 +418,10 @@ asyncio.run(main())
 > **The Python API's `client.move()` consumes the source's copy count without displaying a confirmation prompt.**  
 > Please check the target recording and the remaining copy count in the calling application.
 
+For metadata retrieval, `await server.collect_metadata(recording)` returns a `RecordingMetadata` archive containing the listing, optional chapters, additional details and query statuses. Use `additional=False` to package only the listing without extra network requests.  
+`await server.get_chapters(recording)` requests chapters separately, while `server.extension` exposes family-specific operations such as `SonyExtension.get_title_info()` and `NasneExtension.get_title_list()`. These operations share the media server's HTTP session.  
+`server.iter_recordings()` traverses the family's recording containers, and `server.get_service_description(service)` exposes the actions and ordered arguments advertised by a UPnP service. Ordinary `browse()` and `get_metadata()` calls perform only their usual listing request.
+
 > [!TIP]  
 > If you use your own storage location, such as an OS keychain, you can pass bytes directly to `DeviceCredentials(certificate=..., private_key=...)` without using `DeviceStore`.  
 > You can still manage SRM updates through the `on_srm_update` callback in that case (the same applies to `DubbingReceiver`).
@@ -421,9 +456,17 @@ However, whether subtitles and data broadcasts are included or only video and au
 > As a practical tendency, devices such as TVs that mainly use DR (Direct Recording) mode to record broadcasts without conversion often retain subtitles and the full set of program metadata in the TS. This tendency has been observed on actual REGZA TVs.  
 > In contrast, for recordings compressed with AVC (H.264) or similar formats, some recorders may not include program title or broadcast time descriptors in the SIT (as described above).
 > 
-> For this reason, **`move` and `receive` in the reference CLI implementation save DIDL-Lite XML (`.xml`) retrieved through DLNA as a sidecar file alongside the `.m2ts` file.**  
+> For this reason, **`move` and `receive` in the reference CLI implementation save XML and JSON metadata sidecars alongside the `.m2ts` file.**  
 > DIDL-Lite stores broadcast metadata such as program titles, detailed descriptions, broadcast dates and times, channel names, genres, and remaining copy counts, and also includes manufacturer- and model-specific extension elements.  
-> **We recommend keeping `.m2ts` and `.xml` together when archiving so that programs can be identified later, even for recordings from recorders that do not store program information inside the TS.**
+> **Keep `.m2ts`, `.xml` and `.metadata.json` together when archiving so that programs can be identified later, including information absent from the TS.**
+
+The XML retains the established DIDL-Lite item format, with ARIB broadcast symbols converted to readable Unicode. The JSON contains parsed fields alongside the source XML values before that conversion, resource attributes, raw copy counts, their interpretation and observation times.  
+For client-initiated Move, it also includes the device description, service descriptions used by optional queries, chapters and additional responses. The source item XML is reserialized, so namespace prefixes and whitespace can differ from the response; incoming transfers additionally preserve the sender's complete `CreateObject` XML unchanged.
+The JSON's `responses` field retains complete HTTP and SOAP response bodies, headers, status codes and observation times even when their metadata format cannot be parsed.
+
+The JSON records whether each optional query succeeded, was omitted, is unsupported, was not requested or failed. Transfer headers, copy-control observations and receipt, persistence and Move lifecycle events are appended separately; a transfer failure retains the collected metadata, and `resume` updates an existing archive.  
+If an event update fails, the CLI logs a warning and continues saving and finalizing the recording. Subsequent events retry the metadata update with the accumulated history, but the saved history can remain incomplete if the storage error persists.  
+Metadata sidecars contain no authentication keys or Move resume secrets. They do contain program titles and device addresses, so treat them as personal archives when sharing files.
 
 ## Device-specific behavior and contributing to compatibility
 
@@ -597,7 +640,7 @@ The supported scope and excluded functions are as follows.
 | UPnP / DLNA | SSDP discovery and advertisement / ContentDirectory browsing / CreateObject / DestroyObject / GENA event notifications (on the dubbing receiver side) / `protocolInfo` / `TimeSeekRange` / `X_GetDLNAUploadProfiles` | Recording scheduling / electronic program guide (EPG) / manufacturer-specific conversion preparation for devices / playback control of general-purpose media players |
 | DTCP-IP authentication / cryptography | Full Authentication (ECDSA / ECDH) / IP TTL = 3 restriction / RTT proximity checks / PCP (AES-128-CBC decryption and E-EMI retrieval) / SRM signature verification, revocation checks, and mutual updates | Enhanced Full Authentication / PCP2 / remote access outside the home / DTCP+ |
 | Move / transfer / streaming | Normal streaming (`on_data` backpressure control) / GET Move (`FINALIZE` / `COMPLETE` / `CANCEL` / resume) / POST Move reception (`DubbingReceiver`) | Providing a playback streaming server as a DTCP Source |
-| Device compatibility | Handling metadata and HTTP status differences through an inheritable profile tree (`generic` → `toshiba` → `toshiba_regza_tv`, and `generic` → `nasne`) | Proprietary extensions of unverified models (supported by adding profiles based on real-device responses) |
+| Device compatibility | An inheritable profile tree for recorder, NAS and set-top box metadata, with separate optional communication extensions | Hardware verification of the additional families and queries listed under Supported devices |
 
 The implementation is designed to follow the publicly available DTCP V1 / V1SE, DLNA, and ARIB specifications and real-device behavior as faithfully as possible.
 

@@ -540,6 +540,8 @@ class DubbingReceiver:
             for parsed in parse_didl(ET.tostring(root, encoding='unicode'), GENERIC)
             if isinstance(parsed, Recording)
         ]
+        # Keep the sender's original IDs, URLs and metadata before assigning receiver-local values
+        recordings[0] = recordings[0].model_copy(update={'source_xml': arguments['Elements']})
         self._items[item_id] = _UploadItem(item_id, item, recordings[0])
         self._update_id += 1
         return {'ObjectID': item_id, 'Result': ET.tostring(root, encoding='unicode')}

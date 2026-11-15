@@ -1,21 +1,32 @@
 """Exercise family metadata through real local HTTP and SOAP exchanges."""
 
+import asyncio
+import errno
+import os
 import socket
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from html import escape
+from pathlib import Path
+from urllib.parse import urlsplit
 from xml.etree import ElementTree as ET
 
 import aiohttp
 import pytest
 from aiohttp import web
 from aiohttp.abc import AbstractResolver, ResolveResult
+from typer.testing import CliRunner
 
-from pydtcpip import DLNAClient, Recording
+from pydtcpip import DLNAClient, Recording, RecordingMetadata
+from pydtcpip.__main__ import app
 from pydtcpip.dlna.didl import parse_didl
 from pydtcpip.dlna.extensions.xml_chapters import ChapterFormat, parse_chapters
 from pydtcpip.dlna.profiles import PROFILES
 from pydtcpip.errors import DLNAError
+from pydtcpip.events import AuthenticationCompleted, MoveCompleted
+from pydtcpip.metadata import MetadataSidecar
+from pydtcpip.models import MoveResumeState
+from tests.fakes import FakeAuthority, FakeDevice, FakeMediaServer, FakeSourceAKE, Framing
 
 
 _CDS = 'urn:schemas-upnp-org:service:ContentDirectory:1'
@@ -161,9 +172,12 @@ class MetadataSource:
         self.requests: list[str] = []
         self.raw_description = ''
         self.requery_didl: str | None = None
+        self.response_bodies: dict[str, bytes] = {}
 
     async def handle(self, request: web.Request) -> web.Response:
         self.requests.append(request.path)
+        if request.path in self.response_bodies:
+            return web.Response(body=self.response_bodies[request.path])
         if request.path == '/description.xml':
             self.raw_description = f"""<root xmlns="urn:schemas-upnp-org:device-1-0"><device>
             <manufacturer>{self.manufacturer}</manufacturer><modelName>{self.model}</modelName>
@@ -211,6 +225,8 @@ class MetadataSource:
         name = action.tag.rpartition('}')[2]
         arguments = {child.tag: child.text or '' for child in action}
         self.calls.append((name, arguments))
+        if name in self.response_bodies:
+            return web.Response(body=self.response_bodies[name], content_type='text/xml')
         if name == 'Browse':
             result = self.didl
             if self.requery_didl is not None:
@@ -261,13 +277,14 @@ class MetadataSource:
         ('I-O DATA', 'GV-NTX2', '', '', 'shared_tags', 'X_TShrGetTags'),
     ],
 )
-async def test_metadata_collection(
+async def test_metadata_collection_and_sidecars(
     manufacturer: str,
     model: str,
     fields: str,
     attributes: str,
     format: ChapterFormat,
     action: str,
+    tmp_path: Path,
 ) -> None:
     chapter = dict(_CHAPTER_CASES)[format]
     # Sony detail IDs match the original numeric suffix, while chapter SOAP must retain the original DIDL ID
@@ -300,6 +317,19 @@ async def test_metadata_collection(
             ('storage', 'known'),
         ]
         assert '270000' in metadata.model_dump_json()
+    output = tmp_path / 'recording.m2ts'
+    sidecar = MetadataSidecar(output, metadata)
+    sidecar.on_event(AuthenticationCompleted(transfer_id='test', exchange_key_label=7))
+    resumed = MetadataSidecar.resume(output)
+    assert resumed is not None
+    resumed.on_event(MoveCompleted(transfer_id='test'))
+    saved = RecordingMetadata.model_validate_json(output.with_suffix('.metadata.json').read_bytes())
+    assert saved.recording == recording
+    assert saved.chapters == metadata.chapters
+    assert [event['type'] for event in saved.transfer_events] == ['move_completed']
+    assert output.with_suffix('.xml').read_text() == recording.raw_xml
+    with pytest.raises(FileExistsError):
+        MetadataSidecar(output, metadata)
 
 
 @pytest.mark.anyio
@@ -321,6 +351,300 @@ async def test_nasne_http_metadata_keeps_unmappable_chapters() -> None:
         'startDateTime': 1767265200,
     }
     assert len(metadata.chapters.raw_responses) == 2
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('additional', [True, False])
+async def test_optional_failure_preserves_metadata_and_cli_output(additional: bool) -> None:
+    source = MetadataSource(
+        'Panasonic',
+        'BD/DVD Recorder',
+        recording_xml(attributes='pxn:ChapterList="/chapters" pxn:CopyCount="1"'),
+        '<broken>',
+    )
+    async with source.serve() as (location, _):
+        args = ['info', '--server', location, '--id', 'V_42']
+        if additional is False:
+            args.append('--basic')
+        result = await asyncio.to_thread(CliRunner().invoke, app, [*args, '--json'])
+        assert result.exit_code == 0, result.output
+        saved = RecordingMetadata.model_validate_json(result.stdout)
+        assert saved.recording.protection.remaining_copy_count.value == 0
+        assert saved.queries[0].status == ('failed' if additional else 'not_observed')
+        assert ('/chapters' in source.requests) is additional
+        assert [response.body for response in saved.responses] == ([b'<broken>'] if additional else [])
+        result = await asyncio.to_thread(CliRunner().invoke, app, args)
+        assert result.exit_code == 0, result.output
+        assert 'Includes final Move' in result.output
+        assert '1920x1080' in result.output
+        assert '2026-01-01T20:00:00+09:00' in result.output
+        assert (
+            'Could not retrieve chapters' in result.output
+            if additional
+            else 'Could not retrieve chapters' not in result.output
+        )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ('manufacturer', 'model', 'endpoint', 'body', 'failed_query'),
+    [
+        ('TOSHIBA', 'DBR-TEST', 'X_Toshiba_GetChapterList', b'<broken-soap>', 'chapters'),
+        ('TOSHIBA', 'DBR-TEST', '/scpd.xml', b'<broken-service>', 'chapters'),
+        ('TOSHIBA', 'DBR-TEST', '/scpd.xml', b'<scpd>\xff</scpd>', 'chapters'),
+        (
+            'Sony',
+            'BDZ-TEST',
+            'X_GetTitleList2',
+            b'<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">'
+            b'<s:Body><Response><Result>&lt;broken-title&gt;</Result></Response></s:Body></s:Envelope>',
+            'recording_details',
+        ),
+        ('Buffalo', 'buffalo-nasne', '/recorded/thumbnailMapGet', b'\x00\xff', 'chapters'),
+        ('Buffalo', 'buffalo-nasne', '/recorded/titleListGet', b'{"unknown": "title data"}', 'recording_details'),
+    ],
+)
+async def test_failed_metadata_parsing_archives_received_responses(
+    manufacturer: str,
+    model: str,
+    endpoint: str,
+    body: bytes,
+    failed_query: str,
+    tmp_path: Path,
+) -> None:
+    """Keep HTTP and SOAP documents available for later parsing after an optional query fails.
+
+    Args:
+        manufacturer (str): Device manufacturer
+        model (str): Device model used to select the family
+        endpoint (str): HTTP path or SOAP action returning the invalid document
+        body (bytes): Complete but unparseable metadata response
+        failed_query (str): Query expected to report the parsing failure
+        tmp_path (Path): Isolated sidecar destination
+    """
+
+    source = MetadataSource(manufacturer, model, recording_xml(), action='X_Toshiba_GetChapterList')
+    source.response_bodies[endpoint] = body
+    async with source.serve() as (_, port):
+        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(resolver=LocalResolver(port))) as session:
+            async with DLNAClient(http_session=session) as dlna:
+                server = await dlna.get_server('http://recorder.test/description.xml')
+                recording = await server.get_metadata('V_42')
+                assert isinstance(recording, Recording)
+                metadata = await server.collect_metadata(recording)
+    query_statuses = {query.name: query.status for query in metadata.queries}
+    assert query_statuses[failed_query] == 'failed'
+    output = tmp_path / 'recording.m2ts'
+    MetadataSidecar(output, metadata)
+    saved = RecordingMetadata.model_validate_json(output.with_suffix('.metadata.json').read_bytes())
+    matching_responses = []
+    for response in saved.responses:
+        if response.body == body:
+            matching_responses.append(response)
+    (response,) = matching_responses
+    assert response.status_code == 200
+    assert response.headers
+    if endpoint.startswith('/'):
+        assert urlsplit(response.url).path == endpoint
+        assert response.soap_action is None
+    else:
+        assert response.soap_action is not None and response.soap_action.endswith(f'#{endpoint}')
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('encoding', ['utf-8-sig', 'utf-16', 'utf-16-be', 'iso-8859-1'])
+async def test_service_description_preserves_declared_encoding(encoding: str) -> None:
+    """Query chapters using service definitions with a BOM or a declared character encoding."""
+
+    xml = (
+        f'<?xml version="1.0" encoding="{encoding.removesuffix("-sig")}"?>'
+        '<scpd xmlns="urn:schemas-upnp-org:service-1-0"><!-- café -->'
+        '<actionList><action><name>X_Toshiba_GetChapterList</name></action></actionList></scpd>'
+    )
+    body = xml.encode(encoding)
+    if encoding == 'utf-16-be':
+        body = b'\xfe\xff' + body
+    source = MetadataSource(
+        'TOSHIBA', 'DBR-TEST', recording_xml(), dict(_CHAPTER_CASES)['toshiba'], 'X_Toshiba_GetChapterList'
+    )
+    source.response_bodies['/scpd.xml'] = body
+    async with source.serve() as (location, _), DLNAClient() as dlna:
+        server = await dlna.get_server(location)
+        recording = await server.get_metadata('V_42')
+        assert isinstance(recording, Recording)
+        metadata = await server.collect_metadata(recording)
+    assert metadata.chapters.status == 'known'
+    assert metadata.chapters.chapters[0].position_ms == 12345
+    assert list(metadata.service_descriptions.values()) == [xml]
+    assert metadata.responses[0].body == body
+
+
+@pytest.mark.anyio
+async def test_concurrent_metadata_collections_keep_separate_responses() -> None:
+    """Concurrent collections on one connection archive only their own documents."""
+
+    source = MetadataSource('Panasonic', 'BD/DVD Recorder', recording_xml())
+    source.response_bodies = {'/chapters-first': b'<first>', '/chapters-second': b'<second>'}
+    async with source.serve() as (location, _), DLNAClient() as dlna:
+        server = await dlna.get_server(location)
+        recordings: list[Recording] = []
+        for name in ('first', 'second'):
+            recording = parse_didl(recording_xml(attributes=f'pxn:ChapterList="/chapters-{name}"'), server.profile)[0]
+            assert isinstance(recording, Recording)
+            recordings.append(recording)
+        archives = await asyncio.gather(*(server.collect_metadata(recording) for recording in recordings))
+        assert [[response.body for response in archive.responses] for archive in archives] == [
+            [b'<first>'],
+            [b'<second>'],
+        ]
+        await server.fetch_metadata('/chapters-first')
+        basic = await server.collect_metadata(recordings[0], additional=False)
+        assert basic.responses == ()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('framing', ['length', 'chunked'])
+@pytest.mark.parametrize('should_fail_finalized_sidecar', [False, True])
+async def test_cli_move_archives_metadata_and_completion(
+    authority: FakeAuthority,
+    sink_device: FakeDevice,
+    source_device: FakeDevice,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    framing: Framing,
+    should_fail_finalized_sidecar: bool,
+) -> None:
+    """Run the CLI through listing, metadata collection, encrypted transfer and finalization."""
+
+    monkeypatch.setenv('PYDTCPIP_CERTIFICATE', sink_device.certificate.hex())
+    monkeypatch.setenv('PYDTCPIP_PRIVATE_KEY', sink_device.private_key.hex())
+    monkeypatch.setattr('pydtcpip.__main__._COPY_COUNT_REQUERY_INTERVAL', 0.01)
+    output = tmp_path / 'recording.m2ts'
+    replace = os.replace
+    failed_updates: list[str] = []
+
+    def replace_file(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        """Fail only the metadata update after the source has accepted finalization.
+
+        Args:
+            src (str | os.PathLike[str]): Completed temporary file
+            dst (str | os.PathLike[str]): Destination of the replacement
+        """
+
+        if should_fail_finalized_sidecar is True and Path(dst) == output.with_suffix('.metadata.json'):
+            archive = RecordingMetadata.model_validate_json(Path(src).read_bytes())
+            if archive.transfer_events[-1]['type'] == 'move_finalized':
+                failed_updates.append('move_finalized')
+                raise OSError(errno.ENOSPC, 'Metadata volume is full')
+        replace(src, dst)
+
+    monkeypatch.setattr('pydtcpip.metadata.os.replace', replace_file)
+    content = b'Test-only media bytes' * 1000
+    async with (
+        FakeSourceAKE(authority, source_device) as source,
+        FakeMediaServer(source, content, framing=framing) as media,
+    ):
+        metadata_source = MetadataSource(
+            'Panasonic',
+            'BD/DVD Recorder',
+            recording_xml(
+                attributes='pxn:CopyCount="10" pxn:ChapterList="/chapters"',
+                resource_url=media.url,
+            ),
+            dict(_CHAPTER_CASES)['panasonic'],
+        )
+        metadata_source.requery_didl = recording_xml(attributes='pxn:CopyCount="9"', resource_url=media.url)
+        async with metadata_source.serve() as (location, _):
+            result = await asyncio.to_thread(
+                CliRunner().invoke,
+                app,
+                [
+                    '--data-dir',
+                    str(tmp_path / 'device'),
+                    'move',
+                    str(output),
+                    '--server',
+                    location,
+                    '--id',
+                    'V_42',
+                    '--yes',
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert source.errors == []
+        assert source.log[-2:] == ['finalize', 'complete']
+    assert output.read_bytes() == content
+    assert output.with_name(f'{output.name}.pydtcpip-resume.json').exists() is False
+    assert failed_updates == (['move_finalized'] if should_fail_finalized_sidecar else [])
+    saved_text = output.with_suffix('.metadata.json').read_text()
+    metadata = RecordingMetadata.model_validate_json(saved_text)
+    assert metadata.recording.protection.remaining_copy_count.value == 9
+    assert metadata.chapters.chapters[0].position_ms == 12345
+    events = [event['type'] for event in metadata.transfer_events]
+    assert events.index('sink_persisted') < events.index('move_finalize_requested')
+    assert events[-2:] == ['move_finalized', 'move_completed']
+    assert sink_device.private_key.hex() not in saved_text
+    assert 'exchange_key' not in saved_text
+    assert 'resume_secret' not in saved_text
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('lost_response', ['finalize', 'complete'])
+@pytest.mark.parametrize('sidecar_error', ['malformed', 'unreadable'])
+async def test_cli_resume_continues_without_readable_metadata(
+    authority: FakeAuthority,
+    sink_device: FakeDevice,
+    source_device: FakeDevice,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    lost_response: str,
+    sidecar_error: str,
+) -> None:
+    """Complete a real interrupted Move despite an unreadable optional metadata archive."""
+
+    monkeypatch.setenv('PYDTCPIP_CERTIFICATE', sink_device.certificate.hex())
+    monkeypatch.setenv('PYDTCPIP_PRIVATE_KEY', sink_device.private_key.hex())
+    output = tmp_path / 'recording.m2ts'
+    resume_path = output.with_name(f'{output.name}.pydtcpip-resume.json')
+    sidecar_path = output.with_suffix('.metadata.json')
+    content = b'Test-only resumed recording' * 1000
+    async with (
+        FakeSourceAKE(authority, source_device) as source,
+        FakeMediaServer(source, content) as media,
+    ):
+        if lost_response == 'finalize':
+            source.drop_finalize_responses = 1
+        else:
+            source.drop_complete_responses = 1
+        args = ['--data-dir', str(tmp_path / 'device')]
+        result = await asyncio.to_thread(
+            CliRunner().invoke, app, [*args, 'move', str(output), '--url', media.url, '--yes']
+        )
+        assert result.exit_code == 1, result.output
+        state = MoveResumeState.model_validate_json(resume_path.read_bytes())
+        assert state.state == ('finalizing' if lost_response == 'finalize' else 'finalized')
+        get_count = media.count('GET')
+        sidecar_path.write_bytes(b'{"recording":')
+        read_bytes = Path.read_bytes
+
+        def read_file(path: Path) -> bytes:
+            """Fail only the metadata read while keeping media and resume state readable."""
+
+            if path == sidecar_path and sidecar_error == 'unreadable':
+                raise PermissionError(errno.EACCES, 'Metadata access denied')
+            return read_bytes(path)
+
+        monkeypatch.setattr(Path, 'read_bytes', read_file)
+        result = await asyncio.to_thread(CliRunner().invoke, app, [*args, 'resume', str(output)])
+        assert result.exit_code == 0, result.output
+        assert media.count('GET') == get_count
+        assert source.log[-1] == 'complete'
+        assert source.errors == []
+    assert output.read_bytes() == content
+    assert resume_path.exists() is False
+    assert read_bytes(sidecar_path) == b'{"recording":'
+    assert 'Could not load recording metadata' in caplog.text
 
 
 @pytest.mark.anyio

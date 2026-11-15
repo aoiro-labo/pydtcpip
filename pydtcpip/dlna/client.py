@@ -2,7 +2,9 @@
 
 import asyncio
 import logging
+import re
 from collections.abc import AsyncIterator
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from types import TracebackType
 from typing import Self
@@ -65,6 +67,9 @@ class MediaServer:
         self._timeout = timeout
         self.extension: MetadataExtension = create_extension(self)
         self._service_descriptions: dict[str, ServiceDescription] = {}
+        self._metadata_responses: ContextVar[list[MetadataResponse] | None] = ContextVar(
+            'metadata_responses', default=None
+        )
 
     @property
     def content_directory(self) -> ServiceInfo:
@@ -196,25 +201,31 @@ class MediaServer:
 
         queries: list[MetadataQuery] = []
         chapters = ChapterList(status='not_observed')
-        if additional is True:
-            try:
-                chapters = await self.get_chapters(recording)
-                queries.append(MetadataQuery(name='chapters', status=chapters.status))
-            except DLNAError as ex:
-                queries.append(MetadataQuery(name='chapters', status='failed', error=str(ex)))
-            try:
-                queries.extend(await self.extension.get_details(recording))
-            except UnsupportedActionError:
-                queries.append(MetadataQuery(name='recording_details', status='unsupported'))
-            except DLNAError as ex:
-                queries.append(MetadataQuery(name='recording_details', status='failed', error=str(ex)))
-        else:
-            queries.extend(
-                (
-                    MetadataQuery(name='chapters', status='not_observed'),
-                    MetadataQuery(name='recording_details', status='not_observed'),
+        # Capture responses before parsing and keep simultaneous collections on this connection separate
+        responses: list[MetadataResponse] = []
+        token = self._metadata_responses.set(responses)
+        try:
+            if additional is True:
+                try:
+                    chapters = await self.get_chapters(recording)
+                    queries.append(MetadataQuery(name='chapters', status=chapters.status))
+                except DLNAError as ex:
+                    queries.append(MetadataQuery(name='chapters', status='failed', error=str(ex)))
+                try:
+                    queries.extend(await self.extension.get_details(recording))
+                except UnsupportedActionError:
+                    queries.append(MetadataQuery(name='recording_details', status='unsupported'))
+                except DLNAError as ex:
+                    queries.append(MetadataQuery(name='recording_details', status='failed', error=str(ex)))
+            else:
+                queries.extend(
+                    (
+                        MetadataQuery(name='chapters', status='not_observed'),
+                        MetadataQuery(name='recording_details', status='not_observed'),
+                    )
                 )
-            )
+        finally:
+            self._metadata_responses.reset(token)
         return RecordingMetadata(
             recording=recording,
             profile=self.profile.name,
@@ -226,6 +237,7 @@ class MediaServer:
             chapters=chapters,
             queries=tuple(queries),
             service_descriptions={url: description.raw_xml for url, description in self._service_descriptions.items()},
+            responses=tuple(responses),
         )
 
     async def fetch_metadata(self, url: str) -> MetadataResponse:
@@ -242,14 +254,19 @@ class MediaServer:
         url = urljoin(self.description.location, url)
         try:
             async with self._http_session.get(url, timeout=aiohttp.ClientTimeout(total=self._timeout)) as response:
-                if response.status >= 400:
-                    raise DLNAError(f'Metadata request failed (HTTP {response.status}).', http_status=response.status)
-                return MetadataResponse(
+                metadata_response = MetadataResponse(
                     url=str(response.url),
                     headers=dict(response.headers),
                     body=await response.read(),
                     observed_at=datetime.now(UTC),
+                    status_code=response.status,
                 )
+                responses = self._metadata_responses.get()
+                if responses is not None:
+                    responses.append(metadata_response)
+                if response.status >= 400:
+                    raise DLNAError(f'Metadata request failed (HTTP {response.status}).', http_status=response.status)
+                return metadata_response
         except DLNAError as ex:
             raise self.interpret_http_error(ex, url) from ex
         except (aiohttp.ClientError, TimeoutError) as ex:
@@ -270,7 +287,17 @@ class MediaServer:
         if refresh is False and service.scpd_url in self._service_descriptions:
             return self._service_descriptions[service.scpd_url]
         response = await self.fetch_metadata(service.scpd_url)
-        description = parse_service_description(service, response.body.decode('utf-8-sig'))
+        # Preserve the original XML text, including comments, rather than serializing a parsed tree
+        try:
+            if response.body.startswith((b'\xff\xfe', b'\xfe\xff')):
+                raw_xml = response.body.decode('utf-16')
+            else:
+                declaration = re.match(rb'<\?xml\s+[^?]*\bencoding\s*=\s*[\'\"]([^\'\"]+)[\'\"]', response.body)
+                encoding = declaration[1].decode('ascii') if declaration is not None else 'utf-8-sig'
+                raw_xml = response.body.decode(encoding)
+        except (UnicodeError, LookupError) as ex:
+            raise DLNAError('Could not decode the service description XML.') from ex
+        description = parse_service_description(service, raw_xml)
         self._service_descriptions[service.scpd_url] = description
         return description
 
@@ -295,6 +322,7 @@ class MediaServer:
             SOAPResult: Output arguments and original response
         """
 
+        responses = self._metadata_responses.get()
         try:
             return await call_action(
                 self._http_session,
@@ -304,6 +332,7 @@ class MediaServer:
                 arguments,
                 timeout=self._timeout,
                 extra_headers=extra_headers,
+                on_response=responses.append if responses is not None else None,
             )
         except DLNAError as ex:
             raise self.interpret_http_error(ex, service.control_url) from ex

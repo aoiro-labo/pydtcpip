@@ -130,6 +130,8 @@ class MetadataResponse(BaseModel):
     headers: dict[str, str]
     body: bytes
     observed_at: datetime
+    status_code: int | None = None
+    soap_action: str | None = None
 
 
 class MetadataQuery(BaseModel):
@@ -366,6 +368,8 @@ class RecordingMetadata(BaseModel):
     chapters: ChapterList = Field(default_factory=lambda: ChapterList(status='not_observed'))
     queries: tuple[MetadataQuery, ...] = ()
     service_descriptions: dict[str, str] = Field(default_factory=dict)
+    # Complete responses remain available even when their metadata format could not be parsed
+    responses: tuple[MetadataResponse, ...] = ()
     transfer_events: tuple[dict[str, JsonValue], ...] = ()
 
 

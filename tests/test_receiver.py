@@ -1,25 +1,197 @@
 """Exercise DubbingReceiver against a fake television on 127.0.0.1."""
 
 import asyncio
+import errno
 import os
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Coroutine
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+from pathlib import Path
 from xml.dom import minidom
+from xml.etree import ElementTree as ET
 
 import aiohttp
 import pytest
 from rich.progress import Progress
 
+import pydtcpip.__main__ as cli
 from pydtcpip.__main__ import ProgressReporter
 from pydtcpip.dlna.ssdp import SSDPAdvertiser
 from pydtcpip.events import EventCallback, MoveCompleted, TransferEvent, TransferReceived
-from pydtcpip.models import MoveResumeState, Recording
+from pydtcpip.metadata import MetadataSidecar
+from pydtcpip.models import MoveResumeState, Recording, RecordingMetadata
 from pydtcpip.receiver import DubbingReceiver, DubbingResumeStateCallback
+from pydtcpip.sinks import FileSink
+from pydtcpip.store import DeviceStore
 from tests.fakes import FakeAuthority, FakeDevice, FakeSourceAKE, FakeTelevision, Framing, MemorySink
 
 
 # Recording split into four packets, with the last plaintext length not divisible by the AES block size
 _CONTENT = os.urandom(4000 * 3 + 1234)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('is_interrupted', [False, True])
+async def test_cli_receiver_preserves_retries_and_finalization(
+    authority: FakeAuthority,
+    sink_device: FakeDevice,
+    source_device: FakeDevice,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    is_interrupted: bool,
+) -> None:
+    """Complete CLI uploads after interruption and a metadata-only write failure.
+
+    Args:
+        authority (FakeAuthority): Test certificate authority
+        sink_device (FakeDevice): Receiver credentials
+        source_device (FakeDevice): Sender credentials
+        tmp_path (Path): Isolated output directory
+        monkeypatch (pytest.MonkeyPatch): CLI setup and disk failure injection
+        caplog (pytest.LogCaptureFixture): Captured metadata warnings
+        is_interrupted (bool): Retry the same upload after truncating its first body
+    """
+
+    receivers: list[DubbingReceiver] = []
+    tasks: list[asyncio.Task[None]] = []
+    started = asyncio.Event()
+    original_start = DubbingReceiver.start
+    replace = os.replace
+    failed_updates: list[Path] = []
+
+    async def start(receiver: DubbingReceiver) -> None:
+        """Expose the CLI listener to the test sender after startup.
+
+        Args:
+            receiver (DubbingReceiver): CLI-owned receiver
+        """
+
+        await original_start(receiver)
+        receivers.append(receiver)
+        started.set()
+
+    def execute(coroutine: Coroutine[None, None, None]) -> None:
+        """Run the CLI listener in the test's event loop.
+
+        Args:
+            coroutine (Coroutine[None, None, None]): CLI receive loop
+        """
+
+        tasks.append(asyncio.create_task(coroutine))
+
+    def replace_file(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        """Simulate a failed JSON update while media and resume files remain writable.
+
+        Args:
+            src (str | os.PathLike[str]): Completed temporary file
+            dst (str | os.PathLike[str]): Destination of the replacement
+        """
+
+        if str(dst).endswith('.metadata.json'):
+            archive = RecordingMetadata.model_validate_json(Path(src).read_bytes())
+            if archive.transfer_events[-1]['type'] == 'move_finalized':
+                failed_updates.append(Path(dst))
+                raise OSError(errno.ENOSPC, 'Metadata volume is full')
+        replace(src, dst)
+
+    monkeypatch.setattr(cli, '_execute', execute)
+    monkeypatch.setenv('PYDTCPIP_CERTIFICATE', sink_device.certificate.hex())
+    monkeypatch.setenv('PYDTCPIP_PRIVATE_KEY', sink_device.private_key.hex())
+    monkeypatch.setattr(cli, '_device_store', DeviceStore(tmp_path / 'device'))
+    monkeypatch.setattr(DubbingReceiver, 'start', start)
+    monkeypatch.setattr('pydtcpip.metadata.os.replace', replace_file)
+    cli.receive(tmp_path, interface='127.0.0.1', source=['127.0.0.1'], port=0)
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        receiver = receivers[0]
+        async with FakeSourceAKE(authority, source_device) as source:
+            television = FakeTelevision(source, _CONTENT)
+            status, import_uri = await television.create_object(receiver.base_url, title='Retry example')
+            assert status == 200 and import_uri is not None
+            if is_interrupted is True:
+                assert await television.upload(import_uri, truncation='boundary') is None
+                await asyncio.wait_for(source.cancelled.wait(), 5)
+                await asyncio.wait_for(source.disconnected.wait(), 5)
+                assert list(tmp_path.glob('*.m2ts')) == []
+            assert await television.upload(import_uri) == 200
+            await asyncio.wait_for(source.disconnected.wait(), 5)
+            assert source.log[-2:] == ['finalize', 'complete']
+            assert source.errors == []
+            (archive_path,) = tmp_path.glob('*.metadata.json')
+            completed_archive = archive_path.read_bytes()
+            assert await television.upload(import_uri) == 500
+            await asyncio.wait_for(source.disconnected.wait(), 5)
+            assert archive_path.read_bytes() == completed_archive
+    finally:
+        tasks[0].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await tasks[0]
+
+    (output,) = tmp_path.glob('*.m2ts')
+    assert output.read_bytes() == _CONTENT
+    archive = RecordingMetadata.model_validate_json(output.with_suffix('.metadata.json').read_bytes())
+    events = [event['type'] for event in archive.transfer_events]
+    assert ('move_cancelled' in events) is is_interrupted
+    assert events[-2:] == ['move_finalized', 'move_completed']
+    assert failed_updates == [output.with_suffix('.metadata.json')]
+    assert 'Could not update recording metadata' in caplog.text
+    assert list(tmp_path.glob('*.pydtcpip-resume.json')) == []
+
+
+@pytest.mark.anyio
+async def test_incoming_metadata_preserves_sender_xml_and_transfer_events(
+    authority: FakeAuthority,
+    sink_device: FakeDevice,
+    source_device: FakeDevice,
+    tmp_path: Path,
+) -> None:
+    """Archive sender-supplied IDs and text before the receiver rewrites upload metadata."""
+
+    output = tmp_path / 'incoming.m2ts'
+    sidecars: dict[str, MetadataSidecar] = {}
+    completed = asyncio.Event()
+
+    def create_sink(recording: Recording) -> FileSink:
+        sidecars[recording.id] = MetadataSidecar(
+            output,
+            RecordingMetadata(
+                recording=recording,
+                profile='generic',
+                profile_unverified=False,
+                observed_at=datetime.now(UTC),
+            ),
+        )
+        return FileSink(output)
+
+    def on_event(event: TransferEvent) -> None:
+        sidecar = sidecars.get(event.transfer_id)
+        if sidecar is not None:
+            sidecar.on_event(event)
+        if isinstance(event, MoveCompleted):
+            completed.set()
+
+    receiver = DubbingReceiver(sink_device.credentials(), create_sink, interface='127.0.0.1', port=0, on_event=on_event)
+    await receiver.start()
+    try:
+        async with FakeSourceAKE(authority, source_device) as source:
+            television = FakeTelevision(source, _CONTENT)
+            status, import_uri = await television.create_object(receiver.base_url, title='Sample\ue0fe')
+            assert status == 200 and import_uri is not None
+            assert await television.upload(import_uri, framing='chunked') == 200
+            await asyncio.wait_for(completed.wait(), timeout=5)
+            assert source.errors == []
+    finally:
+        await receiver.stop()
+    metadata = RecordingMetadata.model_validate_json(output.with_suffix('.metadata.json').read_bytes())
+    assert metadata.recording.title == 'Sample🈑'
+    assert metadata.recording.source_xml is not None
+    original_item = ET.fromstring(metadata.recording.source_xml)[0]
+    assert original_item.get('id') == ''
+    assert '\ue0fe' in metadata.recording.source_xml
+    assert metadata.recording.id != ''
+    assert metadata.transfer_events[-1]['type'] == 'move_completed'
+    assert output.read_bytes() == _CONTENT
 
 
 @pytest.mark.anyio

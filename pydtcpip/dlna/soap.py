@@ -1,5 +1,7 @@
 """Invoke UPnP actions over SOAP."""
 
+from collections.abc import Callable
+from datetime import UTC, datetime
 from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape
 
@@ -7,6 +9,7 @@ import aiohttp
 from pydantic import BaseModel, ConfigDict
 
 from pydtcpip.errors import DLNAError
+from pydtcpip.models import MetadataResponse
 
 
 SOAP_ENVELOPE_NAMESPACE = 'http://schemas.xmlsoap.org/soap/envelope/'
@@ -34,6 +37,7 @@ async def call_action(
     *,
     timeout: float,
     extra_headers: dict[str, str] | None = None,
+    on_response: Callable[[MetadataResponse], None] | None = None,
 ) -> SOAPResult:
     """
     Invoke a UPnP action and return its output arguments.
@@ -46,6 +50,7 @@ async def call_action(
         arguments (dict[str, str]): Input argument names and values, sent in insertion order
         timeout (float): Response timeout in seconds
         extra_headers (dict[str, str] | None): Additional headers required by an optional service
+        on_response (Callable[[MetadataResponse], None] | None): Retain the complete response before XML parsing
 
     Returns:
         SOAPResult: Output arguments and response XML
@@ -73,11 +78,23 @@ async def call_action(
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=timeout),
         ) as response:
-            raw_xml = await response.text(encoding='utf-8', errors='replace')
+            raw_body = await response.read()
             status = response.status
+            if on_response is not None:
+                on_response(
+                    MetadataResponse(
+                        url=str(response.url),
+                        headers=dict(response.headers),
+                        body=raw_body,
+                        observed_at=datetime.now(UTC),
+                        status_code=status,
+                        soap_action=f'{service_type}#{action}',
+                    )
+                )
     except (aiohttp.ClientError, TimeoutError) as ex:
         raise DLNAError(f'{action} request failed ({ex}).') from ex
 
+    raw_xml = raw_body.decode('utf-8', errors='replace')
     try:
         envelope = ET.fromstring(raw_xml)
     except ET.ParseError as ex:
