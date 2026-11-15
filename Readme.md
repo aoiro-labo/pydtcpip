@@ -1,6 +1,10 @@
 <!-- omit in toc -->
 # pydtcpip - Unofficial Python implementation of DTCP-IP with DLNA/UPnP support
 
+[![PyPI](https://img.shields.io/pypi/v/pydtcpip?color=blue)](https://pypi.org/project/pydtcpip/)
+[![Python](https://img.shields.io/pypi/pyversions/pydtcpip)](https://pypi.org/project/pydtcpip/)
+[![ci](https://github.com/tsukumijima/pydtcpip/actions/workflows/ci.yml/badge.svg)](https://github.com/tsukumijima/pydtcpip/actions/workflows/ci.yml)
+
 **pydtcpip is an open-source, cross-platform Python library that can transfer broadcast recordings stored on Japanese home TVs and BD / HDD recorders to a PC using DLNA / UPnP / DTCP-IP.**
 
 It can handle the entire process from device discovery and recording listings to mutual authentication, decryption, Move transfers, listening for incoming dubbing transfers, and streaming reception.  
