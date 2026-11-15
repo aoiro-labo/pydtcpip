@@ -64,6 +64,8 @@ _KEPT_DIDL_ATTRIBUTES = frozenset(
         'sampleFrequency',
         'bitsPerSample',
         'colorDepth',
+        # Remaining copy counts are small integers, and the same value is retained for element text
+        'CopyCount',
     )
 )
 
