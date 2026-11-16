@@ -327,7 +327,7 @@ async def test_metadata_collection_and_sidecars(
     assert saved.recording == recording
     assert saved.chapters == metadata.chapters
     assert [event['type'] for event in saved.transfer_events] == ['move_completed']
-    assert output.with_suffix('.xml').read_text() == recording.raw_xml
+    assert output.with_suffix('.xml').read_text(encoding='utf-8') == recording.raw_xml
     with pytest.raises(FileExistsError):
         MetadataSidecar(output, metadata)
 
@@ -576,7 +576,7 @@ async def test_cli_move_archives_metadata_and_completion(
     assert output.read_bytes() == content
     assert output.with_name(f'{output.name}.pydtcpip-resume.json').exists() is False
     assert failed_updates == (['move_finalized'] if should_fail_finalized_sidecar else [])
-    saved_text = output.with_suffix('.metadata.json').read_text()
+    saved_text = output.with_suffix('.metadata.json').read_text(encoding='utf-8')
     metadata = RecordingMetadata.model_validate_json(saved_text)
     assert metadata.recording.protection.remaining_copy_count.value == 9
     assert metadata.chapters.chapters[0].position_ms == 12345
